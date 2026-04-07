@@ -16,14 +16,15 @@ from prime_rl.utils.config import BaseConfig
 
 # -- Shared trainer configs (used by both SFT and RL trainers) --
 
-AttnImplementation: TypeAlias = Literal["sdpa", "flash_attention_2", "flash_attention_3", "fa4", "flex_attention"]
+AttnImplementation: TypeAlias = Literal[
+    "sdpa", "flash_attention_2", "flash_attention_3", "flash_attention_4", "fa4", "flex_attention"
+]
 EPCommBackend: TypeAlias = Literal["torch", "deepep"]
 
-# User-facing name -> internal name. Users set `flash_attention_4` in configs,
-# which gets rewritten to `fa4` before pydantic validation.
-# We use `fa4` internally because `flash_attention_*` triggers transformers
-# to attempt installing a kernel from hub.
-_ATTN_ALIASES = {"flash_attention_4": "fa4"}
+# User-facing name -> internal name. `fa4` is the prime-rl custom model
+# implementation of flash attention 4. `flash_attention_4` passes through
+# to the transformers built-in backend for HF models.
+_ATTN_ALIASES: dict[str, str] = {}
 
 
 class GCConfig(BaseConfig):
