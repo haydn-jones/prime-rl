@@ -119,7 +119,7 @@ override-dependencies = [
 ]
 
 [tool.uv.sources]
-torch = { index = "pytorch-cu128" }
+torch = { index = "pytorch-cu130" }
 verifiers = { git = "https://github.com/PrimeIntellect-ai/verifiers.git", rev = "0760204" }
 torchtitan = { git = "https://github.com/pytorch/torchtitan", rev = "a1fdd7e" }
 dion = { git = "https://github.com/samsja/dion.git", rev = "d891eeb" }
@@ -160,8 +160,8 @@ url = "https://hub.primeintellect.ai/primeintellect/simple/"
 explicit = true
 
 [[tool.uv.index]]
-name = "pytorch-cu128"
-url = "https://download.pytorch.org/whl/cu128"
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
 explicit = true
 
 
