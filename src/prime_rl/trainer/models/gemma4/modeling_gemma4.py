@@ -290,6 +290,18 @@ class Gemma4Attention(nn.Module):
         output = _compiled_flex_attention(q, k, v, block_mask=block_mask, scale=1.0)
         return output.transpose(1, 2).squeeze(0)
 
+    def compute_kv(
+        self,
+        hidden_states: torch.Tensor,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Compute K/V for this layer. Used to pre-populate shared KV outside checkpointed regions."""
+        hidden_shape = (*hidden_states.shape[:-1], -1, self.head_dim)
+        cos, sin = position_embeddings
+        k = _apply_rotary_pos_emb(self.k_norm(self.k_proj(hidden_states).view(hidden_shape)), cos, sin)
+        v = self.v_norm(self.v_proj(hidden_states).view(hidden_shape))
+        return k, v
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -306,10 +318,7 @@ class Gemma4Attention(nn.Module):
         if self.kv_shared_layer_index is not None and shared_kv is not None:
             k, v = shared_kv[self.kv_shared_layer_index]
         else:
-            k = _apply_rotary_pos_emb(self.k_norm(self.k_proj(hidden_states).view(hidden_shape)), cos, sin)
-            v = self.v_norm(self.v_proj(hidden_states).view(hidden_shape))
-            if self.store_full_length_kv and shared_kv is not None:
-                shared_kv[self.layer_idx] = (k, v)
+            k, v = self.compute_kv(hidden_states, position_embeddings)
 
         q = q.contiguous().flatten(0, 1)
         k = k.contiguous().flatten(0, 1)
@@ -372,10 +381,15 @@ class Gemma4DecoderLayer(GradientCheckpointingLayer):
         block_mask: BlockMask | None = None,
     ) -> torch.Tensor:
         residual = hidden_states
-        hidden_states = self.input_layernorm(hidden_states)
-        hidden_states = self.self_attn(
-            hidden_states, position_embeddings, cu_seqlens, max_seqlen, block_mask, shared_kv
-        )
+        normed = self.input_layernorm(hidden_states)
+
+        # Pre-compute source KV before attention so the model loop can store it.
+        # This avoids relying on dict mutation side effects inside checkpointed regions.
+        source_kv: tuple[torch.Tensor, torch.Tensor] | None = None
+        if self.self_attn.store_full_length_kv:
+            source_kv = self.self_attn.compute_kv(normed, position_embeddings)
+
+        hidden_states = self.self_attn(normed, position_embeddings, cu_seqlens, max_seqlen, block_mask, shared_kv)
         hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = residual + hidden_states
 
@@ -391,7 +405,12 @@ class Gemma4DecoderLayer(GradientCheckpointingLayer):
             hidden_states = self.post_per_layer_input_norm(self.per_layer_projection(hidden_states))
             hidden_states = residual + hidden_states
 
-        return hidden_states * self.layer_scalar
+        hidden_states = hidden_states * self.layer_scalar
+
+        if source_kv is not None:
+            # Return KV alongside hidden_states; the model loop stores it into shared_kv
+            return hidden_states, source_kv[0], source_kv[1]
+        return hidden_states
 
 
 class Gemma4Model(nn.Module):
@@ -484,7 +503,7 @@ class Gemma4Model(nn.Module):
         for i, layer in enumerate(self.layers):
             layer_type = layer_types[i]
             block_mask = flex_block_masks[layer_type] if flex_block_masks is not None else None
-            hidden_states = layer(
+            out = layer(
                 hidden_states,
                 position_embeddings[layer_type],
                 cu_seqlens,
@@ -493,6 +512,12 @@ class Gemma4Model(nn.Module):
                 shared_kv,
                 block_mask,
             )
+            # Source layers return (hidden_states, k, v); store KV outside the checkpointed region
+            if isinstance(out, tuple):
+                hidden_states, k, v = out
+                shared_kv[i] = (k, v)
+            else:
+                hidden_states = out
 
         return BaseModelOutputWithPast(last_hidden_state=self.norm(hidden_states))
 
