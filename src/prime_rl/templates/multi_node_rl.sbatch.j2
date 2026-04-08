@@ -203,7 +203,12 @@ if [ "$SLURM_PROCID" -lt "$NUM_INFER_NODES" ]; then
     export VLLM_NIXL_SIDE_CHANNEL_HOST=$LOCAL_IP
     export VLLM_NIXL_SIDE_CHANNEL_PORT=5600
 
-    KV_CFG='"'"'{"kv_connector":"NixlConnector","kv_role":"kv_both","kv_connector_extra_config":{"num_threads":1}}'"'"'
+{%- if kv_offload %}
+    PREFILL_KV_CFG='"'"'{"kv_connector":"MultiConnector","kv_role":"kv_both","kv_connector_extra_config":{"connectors":[{"kv_connector":"NixlConnector","kv_role":"kv_both","kv_connector_extra_config":{"num_threads":1}},{"kv_connector":"OffloadingConnector","kv_role":"kv_both","kv_connector_extra_config":{"block_size":{{ kv_offload_block_size }},"cpu_bytes_to_use":{{ kv_offload_cpu_bytes }}}}]}}'"'"'
+{%- else %}
+    PREFILL_KV_CFG='"'"'{"kv_connector":"NixlConnector","kv_role":"kv_both","kv_connector_extra_config":{"num_threads":1}}'"'"'
+{%- endif %}
+    DECODE_KV_CFG='"'"'{"kv_connector":"NixlConnector","kv_role":"kv_both","kv_connector_extra_config":{"num_threads":1}}'"'"'
     DECODE_COMPILE_CFG='"'"'{"cudagraph_mode":"FULL_DECODE_ONLY"}'"'"'
 
     REPLICA_BASE=$((REPLICA_IDX * NODES_PER_INFER_REPLICA))
@@ -240,13 +245,23 @@ if [ "$SLURM_PROCID" -lt "$NUM_INFER_NODES" ]; then
         | tee -a $OUTPUT_DIR/logs/inference/node_${INFER_NODE_RANK}.log
 
     if [ "$DP" -gt 1 ]; then
-        if [ "$ROLE_RANK" -eq 0 ]; then
-            VLLM_EXTRA="{\"data_parallel_address\": \"$LOCAL_IP\", \"data_parallel_hybrid_lb\": true, \"kv_transfer_config\": $KV_CFG, $ROLE_EXTRA}"
+        if [ "$ROLE" = "prefill" ]; then
+            KV_CFG_TO_USE="$PREFILL_KV_CFG"
         else
-            VLLM_EXTRA="{\"data_parallel_address\": \"$HEAD_HOST\", \"data_parallel_start_rank\": $START_RANK, \"data_parallel_hybrid_lb\": true, \"kv_transfer_config\": $KV_CFG, $ROLE_EXTRA}"
+            KV_CFG_TO_USE="$DECODE_KV_CFG"
+        fi
+
+        if [ "$ROLE_RANK" -eq 0 ]; then
+            VLLM_EXTRA="{\"data_parallel_address\": \"$LOCAL_IP\", \"data_parallel_hybrid_lb\": true, \"kv_transfer_config\": $KV_CFG_TO_USE, $ROLE_EXTRA}"
+        else
+            VLLM_EXTRA="{\"data_parallel_address\": \"$HEAD_HOST\", \"data_parallel_start_rank\": $START_RANK, \"data_parallel_hybrid_lb\": true, \"kv_transfer_config\": $KV_CFG_TO_USE, $ROLE_EXTRA}"
         fi
     else
-        VLLM_EXTRA="{\"kv_transfer_config\": $KV_CFG, $ROLE_EXTRA}"
+        if [ "$ROLE" = "prefill" ]; then
+            VLLM_EXTRA="{\"kv_transfer_config\": $PREFILL_KV_CFG, $ROLE_EXTRA}"
+        else
+            VLLM_EXTRA="{\"kv_transfer_config\": $DECODE_KV_CFG, $ROLE_EXTRA}"
+        fi
     fi
 
     # Start vllm-router on the first node of each replica (PD mode)

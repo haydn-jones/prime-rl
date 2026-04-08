@@ -142,6 +142,20 @@ class MultiNodeInferenceDeploymentConfig(BaseInferenceDeploymentConfig):
     backend_port: Annotated[int, Field(description="Port for vLLM backend instances.")] = 8100
 
 
+class KVCacheOffloadConfig(BaseModel):
+    """CPU KV cache offloading for disaggregated prefill nodes.
+
+    When configured, prefill nodes use MultiConnector (NixlConnector + OffloadingConnector).
+    Decode nodes always use NixlConnector only.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    block_size: Annotated[int, Field(ge=1, description="Block size for the CPU offloading connector.")] = 64
+
+    cpu_bytes: Annotated[int, Field(ge=0, description="CPU bytes available for KV cache offloading.")] = 1_000_000_000
+
+
 class DisaggregatedInferenceDeploymentConfig(BaseInferenceDeploymentConfig):
     """Configures a disaggregated prefill/decode inference deployment.
 
@@ -186,6 +200,11 @@ class DisaggregatedInferenceDeploymentConfig(BaseInferenceDeploymentConfig):
         dict[str, str],
         Field(description="Extra environment variables exported only on decode nodes."),
     ] = {}
+
+    kv_cache_offload: Annotated[
+        KVCacheOffloadConfig | None,
+        Field(description="CPU KV cache offload config for prefill nodes. None = disabled (NixlConnector only)."),
+    ] = None
 
     @property
     def num_nodes(self) -> int:
@@ -319,6 +338,13 @@ class InferenceConfig(BaseConfig):
         bool,
         Field(
             description="Enable expert parallel load balancer (EPLB). Passed to vLLM as `--enable-eplb`.",
+        ),
+    ] = False
+
+    enable_dbo: Annotated[
+        bool,
+        Field(
+            description="Enable dual batch overlap (DBO). Passed to vLLM as `--enable-dbo`.",
         ),
     ] = False
 
@@ -468,6 +494,7 @@ class InferenceConfig(BaseConfig):
             "enable_expert_parallel": "enable_expert_parallel",
             "all2all_backend": "all2all_backend",
             "enable_eplb": "enable_eplb",
+            "enable_dbo": "enable_dbo",
             "seed": "seed",
         }
 

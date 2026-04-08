@@ -2,6 +2,7 @@ import asyncio
 import atexit
 import gc
 import multiprocessing as mp
+import os
 import time
 from concurrent.futures import ThreadPoolExecutor
 
@@ -76,6 +77,13 @@ from prime_rl.utils.utils import (
     strip_env_version,
     to_col_format,
 )
+
+# Hard wall-clock budget for the orchestrator's post-training cleanup. If the
+# graceful shutdown sequence (scheduler / inference pool / env teardown) is
+# still running after this many seconds, we force-exit the process so the run
+# pod terminates instead of sitting wedged forever. The training checkpoint
+# and artifacts are persisted *before* this point, so a forced exit is safe.
+SHUTDOWN_TIMEOUT_S = 300
 
 
 @clean_exit
@@ -891,27 +899,38 @@ async def orchestrate(config: OrchestratorConfig):
         logger.info("Writing final checkpoint")
         ckpt_manager.save(progress, buffer, step=progress.step)
 
-    # Close training batch sender
-    training_batch_sender.close()
+    # Bounded best-effort cleanup. Each await below may block on a remote peer
+    # (env-server ZMQ recv, inference admin httpx aclose, etc.). The outer
+    # asyncio.wait gives the whole sequence a single deadline; if anything
+    # wedges past SHUTDOWN_TIMEOUT_S we force-exit the process. Individual
+    # awaits intentionally do NOT have their own timeouts — asyncio.wait_for
+    # would itself hang on an uncancellable await, which is exactly the
+    # failure mode we're guarding against.
+    async def _graceful_shutdown() -> None:
+        training_batch_sender.close()
+        rollout_executor.shutdown(wait=False)
+        await scheduler.stop()
+        await inference_pool.stop()
+        if teacher_inference_pool is not None:
+            await teacher_inference_pool.stop()
+        event_loop_lag_monitor_task.cancel()
+        atexit.unregister(_cleanup_env_processes)
+        _cleanup_env_processes()
 
-    # Shutdown rollout executor
-    rollout_executor.shutdown(wait=False)
+    shutdown_task = asyncio.create_task(_graceful_shutdown())
+    _, pending = await asyncio.wait({shutdown_task}, timeout=SHUTDOWN_TIMEOUT_S)
 
-    # Stop scheduler
-    await scheduler.stop()
+    if pending:
+        logger.warning(
+            f"Orchestrator shutdown did not complete within {SHUTDOWN_TIMEOUT_S}s; "
+            "forcing process exit. Training artifacts are already persisted."
+        )
+        os._exit(0)
 
-    # Stop inference pool
-    await inference_pool.stop()
-
-    if teacher_inference_pool is not None:
-        await teacher_inference_pool.stop()
-
-    # Cancel event loop lag monitor task
-    event_loop_lag_monitor_task.cancel()
-
-    # Shutdown env processes (also registered as atexit handler for crash safety)
-    atexit.unregister(_cleanup_env_processes)
-    _cleanup_env_processes()
+    # asyncio.wait swallows task exceptions; re-raise so a fast cleanup
+    # failure surfaces the same way as it did when each step was awaited
+    # directly.
+    await shutdown_task
 
     logger.success("Orchestrator finished.")
 

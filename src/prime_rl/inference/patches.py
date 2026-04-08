@@ -1,3 +1,7 @@
+import torch
+from vllm.triton_utils import tl, triton
+
+
 def transformers_v5_compat():
     """vLLM general plugin: patch transformers v5 config attrs that vLLM 0.16 still expects.
 
@@ -10,7 +14,162 @@ def transformers_v5_compat():
         Qwen3VLMoeTextConfig.tie_word_embeddings = False
 
     _patch_qwen35_lora()
+    monkey_patch_deep_gemm_ep_scatter()
     monkey_patch_dp_engine_core_pause_resume_deadlock()
+
+
+@triton.jit
+def _apply_expert_map_triton(expert_id, expert_map):
+    if expert_id != -1:
+        expert_id = tl.load(expert_map + expert_id).to(expert_id.dtype)
+    return expert_id
+
+
+@triton.jit
+def _fwd_kernel_ep_scatter_2_int64(
+    total_token_num,
+    expert_start_loc,
+    recv_x,
+    recv_x_stride0,
+    recv_x_stride1,
+    recv_x_scale,
+    recv_x_scale_stride0,
+    recv_x_scale_stride1,
+    recv_topk,
+    recv_topk_stride0,
+    recv_topk_stride1,
+    output_tensor,
+    output_tensor_stride0,
+    output_tensor_stride1,
+    output_tensor_scale,
+    output_tensor_scale_stride0,
+    output_tensor_scale_stride1,
+    output_index,
+    output_index_stride0,
+    output_index_stride1,
+    topk_num: tl.constexpr,
+    expert_map,
+    HAS_EXPERT_MAP: tl.constexpr,
+    HIDDEN_SIZE: tl.constexpr,
+    HIDDEN_SIZE_PAD: tl.constexpr,
+    SCALE_HIDDEN_SIZE: tl.constexpr,
+    SCALE_HIDDEN_SIZE_PAD: tl.constexpr,
+):
+    start_token_id = tl.program_id(0)
+    grid_num = tl.num_programs(0)
+
+    offset_in = tl.arange(0, HIDDEN_SIZE_PAD)
+    mask = offset_in < HIDDEN_SIZE
+
+    offset_in_s = tl.arange(0, SCALE_HIDDEN_SIZE_PAD)
+    mask_s = offset_in_s < SCALE_HIDDEN_SIZE
+
+    output_tensor_stride0 = output_tensor_stride0.to(tl.int64)
+
+    for token_id in range(start_token_id, total_token_num, grid_num):
+        to_copy = tl.load(recv_x + token_id * recv_x_stride0 + offset_in, mask=mask)
+        to_copy_s = tl.load(
+            recv_x_scale + token_id * recv_x_scale_stride0 + offset_in_s,
+            mask=mask_s,
+        )
+
+        for topk_index in tl.range(0, topk_num, 1, num_stages=4):
+            expert_id = tl.load(recv_topk + token_id * recv_topk_stride0 + topk_index)
+
+            if HAS_EXPERT_MAP:
+                expert_id = _apply_expert_map_triton(expert_id, expert_map)
+
+            if expert_id >= 0:
+                dest_token_index = tl.atomic_add(expert_start_loc + expert_id, 1)
+                dest_token_index_i64 = dest_token_index.to(tl.int64)
+
+                tl.store(
+                    output_index + token_id * output_index_stride0 + topk_index,
+                    dest_token_index,
+                )
+
+                output_tensor_ptr = output_tensor + dest_token_index_i64 * output_tensor_stride0
+                output_tensor_scale_ptr = output_tensor_scale + dest_token_index * output_tensor_scale_stride0
+                tl.store(output_tensor_ptr + offset_in, to_copy, mask=mask)
+                tl.store(output_tensor_scale_ptr + offset_in_s, to_copy_s, mask=mask_s)
+
+
+def _triton_ep_scatter_int64(
+    recv_x: torch.Tensor,
+    recv_x_scale: torch.Tensor,
+    recv_topk: torch.Tensor,
+    num_recv_tokens_per_expert: torch.Tensor,
+    expert_map: torch.Tensor | None,
+    expert_start_loc: torch.Tensor,
+    output_tensor: torch.Tensor,
+    output_tensor_scale: torch.Tensor,
+    m_indices: torch.Tensor,
+    output_index: torch.Tensor,
+) -> None:
+    from vllm.model_executor.layers.fused_moe import deep_gemm_utils
+
+    block_e = 128
+    num_warps = 8
+    num_experts = num_recv_tokens_per_expert.shape[0]
+    hidden_size = recv_x.shape[1]
+
+    assert m_indices.shape[0] % block_e == 0
+    assert expert_start_loc.shape[0] == num_experts
+
+    deep_gemm_utils._fwd_kernel_ep_scatter_1[(num_experts,)](
+        num_recv_tokens_per_expert,
+        expert_start_loc,
+        m_indices,
+        num_experts=num_experts,
+        num_warps=num_warps,
+        BLOCK_E=block_e,
+        BLOCK_EXPERT_NUM=triton.next_power_of_2(num_experts),
+    )
+
+    grid = min(recv_topk.shape[0], 1024 * 8)
+    _fwd_kernel_ep_scatter_2_int64[(grid,)](
+        recv_topk.shape[0],
+        expert_start_loc,
+        recv_x,
+        recv_x.stride(0),
+        recv_x.stride(1),
+        recv_x_scale,
+        recv_x_scale.stride(0),
+        recv_x_scale.stride(1),
+        recv_topk,
+        recv_topk.stride(0),
+        recv_topk.stride(1),
+        output_tensor,
+        output_tensor.stride(0),
+        output_tensor.stride(1),
+        output_tensor_scale,
+        output_tensor_scale.stride(0),
+        output_tensor_scale.stride(1),
+        output_index,
+        output_index.stride(0),
+        output_index.stride(1),
+        topk_num=recv_topk.shape[1],
+        expert_map=expert_map,
+        HAS_EXPERT_MAP=expert_map is not None,
+        num_warps=num_warps,
+        HIDDEN_SIZE=hidden_size,
+        HIDDEN_SIZE_PAD=triton.next_power_of_2(hidden_size),
+        SCALE_HIDDEN_SIZE=recv_x_scale.shape[1],
+        SCALE_HIDDEN_SIZE_PAD=triton.next_power_of_2(recv_x_scale.shape[1]),
+    )
+
+
+def monkey_patch_deep_gemm_ep_scatter():
+    # Temporary local carry of the upstream fix while it is under review:
+    # issue: https://github.com/vllm-project/vllm/issues/39211
+    # PR:    https://github.com/vllm-project/vllm/pull/39213
+    from vllm.logger import init_logger
+    from vllm.model_executor.layers.fused_moe import deep_gemm_utils
+
+    logger = init_logger(__name__)
+
+    deep_gemm_utils.ep_scatter = torch.no_grad()(_triton_ep_scatter_int64)
+    logger.warning("Enabled int64-addressing Triton patch for vLLM DeepGEMM ep_scatter.")
 
 
 def _patch_qwen35_lora():
