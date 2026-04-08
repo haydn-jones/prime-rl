@@ -25,6 +25,13 @@ except ImportError:
 _compiled_flex_attention = torch.compile(flex_attention)
 
 
+class _RMSNorm(nn.RMSNorm):
+    """RMSNorm that preserves input dtype regardless of weight dtype."""
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return super().forward(x).to(x.dtype)
+
+
 def _default_position_ids(x: torch.Tensor) -> torch.Tensor:
     return torch.arange(x.shape[1], device=x.device).unsqueeze(0).expand(x.shape[0], -1)
 
@@ -211,9 +218,9 @@ class Gemma4Attention(nn.Module):
             config.hidden_size,
             bias=config.attention_bias,
         )
-        self.q_norm = nn.RMSNorm(self.head_dim, eps=config.rms_norm_eps)
-        self.k_norm = nn.RMSNorm(self.head_dim, eps=config.rms_norm_eps)
-        self.v_norm = nn.RMSNorm(self.head_dim, eps=config.rms_norm_eps, elementwise_affine=False)
+        self.q_norm = _RMSNorm(self.head_dim, eps=config.rms_norm_eps)
+        self.k_norm = _RMSNorm(self.head_dim, eps=config.rms_norm_eps)
+        self.v_norm = _RMSNorm(self.head_dim, eps=config.rms_norm_eps, elementwise_affine=False)
 
     def _flash_attention(
         self,
@@ -358,17 +365,17 @@ class Gemma4DecoderLayer(GradientCheckpointingLayer):
         self.self_attn = Gemma4Attention(config, layer_idx)
         self.mlp = Gemma4MLP(config, layer_idx)
 
-        self.input_layernorm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.pre_feedforward_layernorm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_feedforward_layernorm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.input_layernorm = _RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = _RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.pre_feedforward_layernorm = _RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_feedforward_layernorm = _RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.register_buffer("layer_scalar", torch.ones(1))
 
         if config.hidden_size_per_layer_input:
             self.act_fn = ACT2FN[config.hidden_activation]
             self.per_layer_input_gate = nn.Linear(config.hidden_size, config.hidden_size_per_layer_input, bias=False)
             self.per_layer_projection = nn.Linear(config.hidden_size_per_layer_input, config.hidden_size, bias=False)
-            self.post_per_layer_input_norm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+            self.post_per_layer_input_norm = _RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def forward(
         self,
@@ -405,7 +412,7 @@ class Gemma4DecoderLayer(GradientCheckpointingLayer):
             hidden_states = self.post_per_layer_input_norm(self.per_layer_projection(hidden_states))
             hidden_states = residual + hidden_states
 
-        hidden_states = hidden_states * self.layer_scalar
+        hidden_states = hidden_states * self.layer_scalar.to(hidden_states.dtype)
 
         if source_kv is not None:
             # Return KV alongside hidden_states; the model loop stores it into shared_kv
@@ -425,7 +432,7 @@ class Gemma4Model(nn.Module):
             config.hidden_size**0.5,
         )
         self.layers = nn.ModuleList(Gemma4DecoderLayer(config, i) for i in range(config.num_hidden_layers))
-        self.norm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.norm = _RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.rotary_emb = Gemma4DualRotaryEmbedding(config)
 
         self.hidden_size_per_layer_input = config.hidden_size_per_layer_input
@@ -439,7 +446,7 @@ class Gemma4Model(nn.Module):
             )
             self.per_layer_model_projection = nn.Linear(config.hidden_size, total_dim, bias=False)
             self.per_layer_model_projection_scale = config.hidden_size**-0.5
-            self.per_layer_projection_norm = nn.RMSNorm(config.hidden_size_per_layer_input, eps=config.rms_norm_eps)
+            self.per_layer_projection_norm = _RMSNorm(config.hidden_size_per_layer_input, eps=config.rms_norm_eps)
             self.per_layer_input_scale = 2.0**-0.5
 
     def _build_per_layer_inputs(
