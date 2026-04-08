@@ -548,6 +548,9 @@ class Gemma4PreTrainedModel(PreTrainedModelPrimeRL):
     config_class = Gemma4Config
     base_model_prefix = "model"
     _no_split_modules = ["Gemma4DecoderLayer"]
+    _supports_flash_attn = True
+    _supports_sdpa = True
+    _supports_flex_attn = True
 
     @classmethod
     def is_hf_state_dict(cls, state_dict: dict[str, Tensor]) -> bool:
