@@ -577,8 +577,8 @@ class Gemma4PreTrainedModel(PreTrainedModelPrimeRL):
 class Gemma4ForCausalLM(Gemma4PreTrainedModel):
     _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
 
-    def __init__(self, config: Gemma4TextConfig | Gemma4Config) -> None:
-        super().__init__(config)
+    def __init__(self, config: Gemma4TextConfig | Gemma4Config, **kwargs: object) -> None:
+        super().__init__(config, **kwargs)
         if isinstance(config, Gemma4Config):
             text_config = cast(Gemma4TextConfig, config.text_config)
             self.model: Gemma4Model | Gemma4MultimodalModel = Gemma4MultimodalModel(config)
