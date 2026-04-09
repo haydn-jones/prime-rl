@@ -6,7 +6,7 @@ from typing import cast
 
 import torch
 from torch import Tensor, nn
-from torch.nn.attention.flex_attention import BlockMask, create_block_mask, flex_attention
+from torch.nn.attention.flex_attention import BlockMask, FlexKernelOptions, create_block_mask, flex_attention
 from transformers.activations import ACT2FN
 from transformers.modeling_layers import GradientCheckpointingLayer
 from transformers.modeling_outputs import BaseModelOutputWithPast
@@ -16,13 +16,27 @@ from prime_rl.trainer.models.base import PreTrainedModelPrimeRL
 from prime_rl.trainer.models.gemma4.converting_gemma4 import run_on_flat_language_model_keys
 from prime_rl.trainer.models.layers.lm_head import PrimeLmOutput
 
-try:
-    from flash_attn import flash_attn_varlen_func
-except ImportError:
-    flash_attn_varlen_func = None  # ty:ignore[invalid-assignment]
+# Compile flex_attention with inductor autotuning for best kernel selection
+_compiled_flex_attention = torch.compile(
+    flex_attention,
+    options={
+        "max_autotune": True,
+        "coordinate_descent_tuning": True,
+        "triton.cudagraphs": False,
+    },
+)
 
-# Compile flex_attention for performance — this is the intended usage per PyTorch docs
-_compiled_flex_attention = torch.compile(flex_attention)
+# For head_dim=512 (full attention layers), default block sizes OOM on registers.
+# BLOCK_M/N=32 fits within B200's 232448-byte register limit.
+# Backward block sizes must also be pinned — without them the autotuner explores
+# 64x64 backward configs that exceed the register limit and crash with
+# IS_DIVISIBLE=False (any seq_len not perfectly aligned).
+# BLOCK_M1=16 (phase 1 / dK,dV) is ~6% faster than 32 for the backward pass.
+_FLEX_HD512_KERNEL_OPTIONS: FlexKernelOptions = {
+    "BLOCK_M": 32, "BLOCK_N": 32,
+    "BLOCK_M1": 16, "BLOCK_N1": 32,
+    "BLOCK_M2": 32, "BLOCK_N2": 32,
+}
 
 
 class _RMSNorm(nn.RMSNorm):
@@ -63,68 +77,47 @@ def _get_kv_sharing_info(config: Gemma4TextConfig, layer_idx: int) -> tuple[int 
     return None, layer_idx == source_idx
 
 
-def _compute_cu_seqlens(
-    position_ids: torch.Tensor,
-    use_flash_attn: bool,
-) -> tuple[torch.Tensor | None, int | None]:
-    batch_size, seq_len = position_ids.shape
-    flat_position_ids = position_ids.reshape(-1)
-    has_resets = (flat_position_ids[1:] == 0).any().item()
+def _document_ids(position_ids: torch.Tensor) -> torch.Tensor:
+    """Compute per-token document IDs from position_ids (resets mark new documents).
 
-    if not use_flash_attn and batch_size == 1 and not has_resets:
-        return None, None
-
-    if not has_resets:
-        cu_seqlens = torch.arange(
-            0,
-            (batch_size + 1) * seq_len,
-            seq_len,
-            device=position_ids.device,
-            dtype=torch.int32,
-        )
-        return cu_seqlens, seq_len
-
-    seqlens = torch.cat(
-        [
-            flat_position_ids[:1],
-            flat_position_ids[:-1][(flat_position_ids == 0)[1:]] + 1,
-            flat_position_ids[-1:] + 1,
-        ]
-    )
-    return seqlens.cumsum(dim=0, dtype=torch.int32), int(seqlens.max().item())
+    A new document begins wherever positions reset, i.e. positions[i] <= positions[i-1].
+    Returns a flat 1D tensor of document IDs (since we use B=None for BlockMask).
+    """
+    flat = position_ids.reshape(-1)
+    boundaries = torch.zeros_like(flat, dtype=torch.bool)
+    boundaries[1:] = flat[1:] <= flat[:-1]
+    return boundaries.int().cumsum(0)
 
 
 def _build_flex_block_masks(
-    cu_seqlens: torch.Tensor,
+    doc_ids: torch.Tensor,
     total_len: int,
     sliding_window: int | None,
 ) -> dict[str, BlockMask]:
-    """Build BlockMasks for flex_attention: one per layer type (sliding vs full)."""
+    """Build BlockMasks for flex_attention: one per layer type (sliding vs full).
 
-    def _causal_mask(b: torch.Tensor, h: torch.Tensor, q_idx: torch.Tensor, kv_idx: torch.Tensor) -> torch.Tensor:
-        causal = q_idx >= kv_idx
-        # Same-sequence check: both q and kv must be in the same packed sequence
-        seq_id_q = (q_idx.unsqueeze(-1) >= cu_seqlens).sum(-1) - 1
-        seq_id_kv = (kv_idx.unsqueeze(-1) >= cu_seqlens).sum(-1) - 1
-        same_seq = seq_id_q == seq_id_kv
-        return causal & same_seq
+    Packed sequences require a same-document check so tokens don't attend across
+    document boundaries.
+    """
 
-    full_mask = create_block_mask(_causal_mask, B=1, H=None, Q_LEN=total_len, KV_LEN=total_len, device=cu_seqlens.device)
-    masks: dict[str, BlockMask] = {"full_attention": full_mask}
+    def _causal_packed(b: torch.Tensor, h: torch.Tensor, q_idx: torch.Tensor, kv_idx: torch.Tensor) -> torch.Tensor:
+        return (q_idx >= kv_idx) & (doc_ids[q_idx] == doc_ids[kv_idx])
+
+    masks: dict[str, BlockMask] = {
+        "full_attention": create_block_mask(
+            _causal_packed, B=None, H=None, Q_LEN=total_len, KV_LEN=total_len, device=doc_ids.device,
+        ),
+    }
 
     if sliding_window is not None:
 
-        def _sliding_mask(b: torch.Tensor, h: torch.Tensor, q_idx: torch.Tensor, kv_idx: torch.Tensor) -> torch.Tensor:
-            causal = q_idx >= kv_idx
-            within_window = (q_idx - kv_idx) < sliding_window
-            seq_id_q = (q_idx.unsqueeze(-1) >= cu_seqlens).sum(-1) - 1
-            seq_id_kv = (kv_idx.unsqueeze(-1) >= cu_seqlens).sum(-1) - 1
-            same_seq = seq_id_q == seq_id_kv
-            return causal & within_window & same_seq
+        def _sliding_packed(b: torch.Tensor, h: torch.Tensor, q_idx: torch.Tensor, kv_idx: torch.Tensor) -> torch.Tensor:
+            return (kv_idx <= q_idx) & (q_idx - kv_idx < sliding_window) & (doc_ids[q_idx] == doc_ids[kv_idx])
 
         masks["sliding_attention"] = create_block_mask(
-            _sliding_mask, B=1, H=None, Q_LEN=total_len, KV_LEN=total_len, device=cu_seqlens.device
+            _sliding_packed, B=None, H=None, Q_LEN=total_len, KV_LEN=total_len, device=doc_ids.device,
         )
+
     return masks
 
 
@@ -190,13 +183,10 @@ class Gemma4Attention(nn.Module):
         super().__init__()
         self.layer_idx = layer_idx
         self.layer_type = config.layer_types[layer_idx]  # ty:ignore[not-subscriptable]
-        self.sliding_window = config.sliding_window if self.layer_type == "sliding_attention" else None
         self.head_dim = config.global_head_dim if self.layer_type == "full_attention" else config.head_dim
         self.num_key_value_heads = config.num_key_value_heads
-
         self.kv_shared_layer_index, self.store_full_length_kv = _get_kv_sharing_info(config, layer_idx)
-        self._attn_impl = getattr(config, "_attn_implementation", "sdpa")
-        self._flash_attn_func = flash_attn_varlen_func if self._attn_impl == "flash_attention_2" else None
+        self._kernel_options = _FLEX_HD512_KERNEL_OPTIONS if self.head_dim > 256 else FlexKernelOptions()
 
         self.q_proj = nn.Linear(
             config.hidden_size,
@@ -222,81 +212,6 @@ class Gemma4Attention(nn.Module):
         self.k_norm = _RMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.v_norm = _RMSNorm(self.head_dim, eps=config.rms_norm_eps, elementwise_affine=False)
 
-    def _flash_attention(
-        self,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        cu_seqlens: torch.Tensor,
-        max_seqlen: int,
-    ) -> torch.Tensor:
-        flash_attn = self._flash_attn_func
-        assert flash_attn is not None
-        kwargs: dict[str, object] = {"causal": True, "softmax_scale": 1.0}
-        if self.sliding_window is not None:
-            kwargs["window_size"] = (self.sliding_window - 1, 0)
-        return flash_attn(q, k, v, cu_seqlens, cu_seqlens, max_seqlen, max_seqlen, **kwargs)
-
-    def _sdpa_attention(
-        self,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        cu_seqlens: torch.Tensor | None,
-    ) -> torch.Tensor:
-        q = q.unsqueeze(0).transpose(1, 2)
-        k = k.unsqueeze(0).transpose(1, 2)
-        v = v.unsqueeze(0).transpose(1, 2)
-        if k.shape[1] != q.shape[1]:
-            repeat_factor = q.shape[1] // k.shape[1]
-            k = k.repeat_interleave(repeat_factor, dim=1)
-            v = v.repeat_interleave(repeat_factor, dim=1)
-
-        if self.sliding_window is None and (cu_seqlens is None or len(cu_seqlens) <= 2):
-            output = torch.nn.functional.scaled_dot_product_attention(q, k, v, is_causal=True, scale=1.0)
-            return output.transpose(1, 2).squeeze(0)
-
-        total_len = q.shape[2]
-        if cu_seqlens is None:
-            cu_seqlens = torch.tensor([0, total_len], device=q.device, dtype=torch.int32)
-        mask = torch.full((total_len, total_len), float("-inf"), device=q.device, dtype=q.dtype)
-        for i in range(len(cu_seqlens) - 1):
-            start = int(cu_seqlens[i].item())
-            end = int(cu_seqlens[i + 1].item())
-            seq_len = end - start
-            local_mask = torch.zeros(seq_len, seq_len, device=q.device, dtype=q.dtype)
-            local_mask = local_mask.masked_fill(
-                torch.triu(torch.ones(seq_len, seq_len, device=q.device, dtype=torch.bool), diagonal=1),
-                float("-inf"),
-            )
-            if self.sliding_window is not None:
-                local_mask = local_mask.masked_fill(
-                    torch.tril(torch.ones(seq_len, seq_len, device=q.device, dtype=torch.bool), -self.sliding_window),
-                    float("-inf"),
-                )
-            mask[start:end, start:end] = local_mask
-
-        output = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=mask, scale=1.0)
-        return output.transpose(1, 2).squeeze(0)
-
-    def _flex_attention(
-        self,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        block_mask: BlockMask,
-    ) -> torch.Tensor:
-        # flex_attention expects (B, H, S, D)
-        q = q.unsqueeze(0).transpose(1, 2)
-        k = k.unsqueeze(0).transpose(1, 2)
-        v = v.unsqueeze(0).transpose(1, 2)
-        if k.shape[1] != q.shape[1]:
-            repeat_factor = q.shape[1] // k.shape[1]
-            k = k.repeat_interleave(repeat_factor, dim=1)
-            v = v.repeat_interleave(repeat_factor, dim=1)
-        output = _compiled_flex_attention(q, k, v, block_mask=block_mask, scale=1.0)
-        return output.transpose(1, 2).squeeze(0)
-
     def compute_kv(
         self,
         hidden_states: torch.Tensor,
@@ -309,37 +224,48 @@ class Gemma4Attention(nn.Module):
         v = self.v_norm(self.v_proj(hidden_states).view(hidden_shape))
         return k, v
 
+    def attn_projections(
+        self,
+        hidden_states: torch.Tensor,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor],
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        hidden_shape = (*hidden_states.shape[:-1], -1, self.head_dim)
+        cos, sin = position_embeddings
+        q = _apply_rotary_pos_emb(self.q_norm(self.q_proj(hidden_states).view(hidden_shape)), cos, sin)
+        k, v = self.compute_kv(hidden_states, position_embeddings)
+        return q, k, v
+
+    def output_proj(self, attn_output: torch.Tensor) -> torch.Tensor:
+        return self.o_proj(attn_output)
+
     def forward(
         self,
         hidden_states: torch.Tensor,
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
-        cu_seqlens: torch.LongTensor | None = None,
-        max_seqlen: int | None = None,
         block_mask: BlockMask | None = None,
         shared_kv: dict[int, tuple[torch.Tensor, torch.Tensor]] | None = None,
     ) -> torch.Tensor:
-        hidden_shape = (*hidden_states.shape[:-1], -1, self.head_dim)
-        cos, sin = position_embeddings
-
-        q = _apply_rotary_pos_emb(self.q_norm(self.q_proj(hidden_states).view(hidden_shape)), cos, sin)
         if self.kv_shared_layer_index is not None and shared_kv is not None:
+            hidden_shape = (*hidden_states.shape[:-1], -1, self.head_dim)
+            cos, sin = position_embeddings
+            q = _apply_rotary_pos_emb(self.q_norm(self.q_proj(hidden_states).view(hidden_shape)), cos, sin)
             k, v = shared_kv[self.kv_shared_layer_index]
         else:
-            k, v = self.compute_kv(hidden_states, position_embeddings)
+            q, k, v = self.attn_projections(hidden_states, position_embeddings)
 
-        q = q.contiguous().flatten(0, 1)
-        k = k.contiguous().flatten(0, 1)
-        v = v.contiguous().flatten(0, 1)
+        # (batch*seq, heads, dim) -> (1, heads, batch*seq, dim) for flex_attention
+        q = q.contiguous().flatten(0, 1).unsqueeze(0).transpose(1, 2)
+        k = k.contiguous().flatten(0, 1).unsqueeze(0).transpose(1, 2)
+        v = v.contiguous().flatten(0, 1).unsqueeze(0).transpose(1, 2)
 
-        if block_mask is not None and self.head_dim <= 256:
-            attn_output = self._flex_attention(q, k, v, block_mask)
-        elif self._flash_attn_func is not None and cu_seqlens is not None and max_seqlen is not None and self.head_dim <= 256:
-            attn_output = self._flash_attention(q, k, v, cu_seqlens, max_seqlen)
-        else:
-            attn_output = self._sdpa_attention(q, k, v, cu_seqlens)
+        attn_output: torch.Tensor = _compiled_flex_attention(
+            q, k, v, block_mask=block_mask, scale=1.0,
+            enable_gqa=True, kernel_options=self._kernel_options,
+        )  # ty:ignore[invalid-assignment]
 
+        attn_output = attn_output.transpose(1, 2).squeeze(0)
         attn_output = attn_output.contiguous().view(*hidden_states.shape[:-1], -1)
-        return self.o_proj(attn_output)
+        return self.output_proj(attn_output)
 
 
 class Gemma4MLP(nn.Module):
@@ -381,12 +307,10 @@ class Gemma4DecoderLayer(GradientCheckpointingLayer):
         self,
         hidden_states: torch.Tensor,
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
-        cu_seqlens: torch.LongTensor | None = None,
-        max_seqlen: int | None = None,
         per_layer_input: torch.Tensor | None = None,
         shared_kv: dict[int, tuple[torch.Tensor, torch.Tensor]] | None = None,
         block_mask: BlockMask | None = None,
-    ) -> torch.Tensor:
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         residual = hidden_states
         normed = self.input_layernorm(hidden_states)
 
@@ -396,7 +320,7 @@ class Gemma4DecoderLayer(GradientCheckpointingLayer):
         if self.self_attn.store_full_length_kv:
             source_kv = self.self_attn.compute_kv(normed, position_embeddings)
 
-        hidden_states = self.self_attn(normed, position_embeddings, cu_seqlens, max_seqlen, block_mask, shared_kv)
+        hidden_states = self.self_attn(normed, position_embeddings, block_mask, shared_kv)
         hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = residual + hidden_states
 
@@ -485,19 +409,9 @@ class Gemma4Model(nn.Module):
             assert input_ids is not None
             per_layer_inputs = self._build_per_layer_inputs(input_ids, inputs_embeds)
 
-        attn_impl = getattr(self.config, "_attn_implementation", "sdpa")
-        use_flash_attn = attn_impl == "flash_attention_2"
-        use_flex_attn = attn_impl == "flex_attention"
-
-        # Always compute cu_seqlens: needed for flash, SDPA fallback (large head_dim), and flex mask construction
-        cu_seqlens, max_seqlen = _compute_cu_seqlens(position_ids, use_flash_attn or use_flex_attn)
-        if use_flash_attn and cu_seqlens is not None:
-            torch._dynamo.mark_dynamic(cu_seqlens, 0)
-
-        flex_block_masks: dict[str, BlockMask] | None = None
-        if use_flex_attn and cu_seqlens is not None:
-            total_len = position_ids.shape[0] * position_ids.shape[1]
-            flex_block_masks = _build_flex_block_masks(cu_seqlens, total_len, self.config.sliding_window)
+        doc_ids = _document_ids(position_ids)
+        total_len = position_ids.shape[0] * position_ids.shape[1]
+        block_masks = _build_flex_block_masks(doc_ids, total_len, self.config.sliding_window)
 
         layer_types = cast(list[str], self.config.layer_types)
         position_embeddings = {
@@ -509,15 +423,17 @@ class Gemma4Model(nn.Module):
         shared_kv: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
         for i, layer in enumerate(self.layers):
             layer_type = layer_types[i]
-            block_mask = flex_block_masks[layer_type] if flex_block_masks is not None else None
+            # .contiguous() is required for activation offloading compatibility:
+            # the slice is a view with large strides from the parent tensor, and
+            # offloading via saved_tensors_hooks can't preserve those strides on
+            # the CPU round-trip, causing compiled backward to fail on stride checks.
+            pli = None if per_layer_inputs is None else per_layer_inputs[:, :, i, :].contiguous()
             out = layer(
                 hidden_states,
                 position_embeddings[layer_type],
-                cu_seqlens,
-                max_seqlen,
-                None if per_layer_inputs is None else per_layer_inputs[:, :, i, :],
+                pli,
                 shared_kv,
-                block_mask,
+                block_masks[layer_type],
             )
             # Source layers return (hidden_states, k, v); store KV outside the checkpointed region
             if isinstance(out, tuple):
@@ -580,8 +496,6 @@ class Gemma4PreTrainedModel(PreTrainedModelPrimeRL):
     config_class = Gemma4Config
     base_model_prefix = "model"
     _no_split_modules = ["Gemma4DecoderLayer"]
-    _supports_flash_attn = True
-    _supports_sdpa = True
     _supports_flex_attn = True
 
     @classmethod
