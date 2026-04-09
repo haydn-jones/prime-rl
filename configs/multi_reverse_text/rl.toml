@@ -8,31 +8,40 @@ name = "PrimeIntellect/Qwen3-0.6B-Reverse-Text-SFT"
 batch_size = 128
 rollouts_per_example = 16
 
-[orchestrator.sampling]
-max_tokens = 128
+[orchestrator.train.sampling]
+max_completion_tokens = 128
 
-[[orchestrator.env]]
+[[orchestrator.train.env]]
 id = "reverse-text"
-address = "tcp://127.0.0.1:5000" # requires: uv run env-server --env.id reverse-text --env.address tcp://127.0.0.1:5000
 
-[[orchestrator.env]]
+[orchestrator.train.env.sampling]
+max_completion_tokens = 127
+
+[[orchestrator.train.env]]
 id = "reverse-text"
 name = "reverse-text-2"
-
-[orchestrator.val]
-interval = 1
-num_examples = 16
 
 [orchestrator.eval]
 interval = 5
 
 [orchestrator.eval.sampling]
-max_tokens = 512
+max_completion_tokens = 512
 
 [[orchestrator.eval.env]]
 id = "reverse-text"
+name = "eval-default"
 num_examples = 32
 rollouts_per_example = 4
+
+[[orchestrator.eval.env]]
+id = "reverse-text"
+name = "eval-custom"
+num_examples = 16
+rollouts_per_example = 2
+
+[orchestrator.eval.env.sampling]
+max_completion_tokens = 256
+temperature = 0.5
 
 [trainer.optim]
 lr = 3e-6

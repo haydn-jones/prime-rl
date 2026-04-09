@@ -2,18 +2,16 @@ import asyncio
 import time
 from itertools import cycle
 from pathlib import Path
-from typing import Any, AsyncContextManager
+from typing import Any
 
 import pandas as pd
 import verifiers as vf
-from openai.types.chat.chat_completion import ChatCompletion, Choice
-from openai.types.completion_usage import CompletionUsage
+from openai.types.chat.chat_completion import ChatCompletion
 from rich.console import Console
 from rich.table import Table
-from verifiers.utils.async_utils import maybe_semaphore
 from verifiers.utils.client_utils import setup_openai_client
 
-from prime_rl.configs.orchestrator import OrchestratorConfig, SamplingConfig
+from prime_rl.configs.orchestrator import OrchestratorConfig
 from prime_rl.transport import TrainingSample
 from prime_rl.utils.utils import (
     format_time,
@@ -21,82 +19,6 @@ from prime_rl.utils.utils import (
     get_ckpt_dir,
     get_step_path,
 )
-
-SEMAPHORE: AsyncContextManager | None = None
-
-
-async def set_semaphore(limit: int):
-    global SEMAPHORE
-    SEMAPHORE = await maybe_semaphore(limit)
-
-
-async def get_semaphore() -> AsyncContextManager:
-    global SEMAPHORE
-    assert SEMAPHORE is not None, "Semaphore not set"
-    return SEMAPHORE
-
-
-def get_sampling_args(sampling_config: SamplingConfig, temperature: float, is_vllm: bool = True) -> dict:
-    # Convert SamplingConfig to vLLM OAI sampling args
-    # https://docs.vllm.ai/en/latest/serving/openai_compatible_server.html#extra-parameters_2
-    sampling_args = dict(sampling_config)
-    sampling_args.pop("temp_scheduler", None)
-    sampling_args["temperature"] = temperature
-    sampling_args["top_p"] = 1.0
-    sampling_args["logprobs"] = True
-    extra_body = dict(sampling_config.extra_body)
-
-    min_tokens = sampling_args.pop("min_tokens")
-    repetition_penalty = sampling_args.pop("repetition_penalty")
-
-    if min_tokens > 0:
-        extra_body["min_tokens"] = min_tokens
-    if repetition_penalty != 1.0:
-        extra_body["repetition_penalty"] = repetition_penalty
-
-    if is_vllm:
-        extra_body["top_k"] = -1
-        extra_body["min_p"] = 0.0
-        extra_body["return_token_ids"] = True
-
-    if extra_body:
-        sampling_args["extra_body"] = extra_body
-
-    return sampling_args
-
-
-def parse_num_completion_tokens(responses: list[list[ChatCompletion]]) -> list[int]:
-    """Parses the number of tokens from a list of chat completions returned by OAI API."""
-    all_num_completion_tokens = []
-    for response in responses:
-        num_completion_tokens = 0
-        for chat_completion in response:
-            assert isinstance(chat_completion, ChatCompletion)
-            assert chat_completion.usage is not None, "Usage should be present in the response"
-            usage = chat_completion.usage
-            assert isinstance(usage, CompletionUsage)
-            num_completion_tokens += usage.completion_tokens
-        all_num_completion_tokens.append(num_completion_tokens)
-    assert len(all_num_completion_tokens) == len(responses), (
-        "Number of completion tokens should be the same as the number of responses"
-    )
-    return all_num_completion_tokens
-
-
-def parse_is_truncated_completions(responses: list[list[ChatCompletion]]) -> list[bool]:
-    """Parses whether the completions were truncated from a list of (multi-turn) OAI chat completions"""
-    all_is_truncated = []
-    for response in responses:
-        is_truncated = False
-        for chat_completion in response:
-            assert isinstance(chat_completion, ChatCompletion)
-            assert len(chat_completion.choices) == 1, "Response should always have one choice"
-            choice = chat_completion.choices[0]
-            assert isinstance(choice, Choice)
-            if choice.finish_reason == "length":
-                is_truncated = True
-        all_is_truncated.append(is_truncated)
-    return all_is_truncated
 
 
 def print_benchmark(history: dict[str, list[Any]]) -> None:
@@ -159,21 +81,20 @@ async def compute_teacher_logprobs(
     async def _compute_single(client_config: vf.ClientConfig, sample: TrainingSample) -> list[float]:
         client = setup_openai_client(client_config)
 
-        async with await get_semaphore():
-            response = await client.post(
-                "/chat/completions/tokens",
-                body={
-                    "model": model_name,
-                    "messages": [{"role": "user", "content": ""}],
-                    "tokens": sample.prompt_ids + sample.completion_ids,
-                    "max_tokens": 1,
-                    "temperature": 1.0,
-                    "top_p": 1.0,
-                    "skip_special_tokens": False,
-                    "prompt_logprobs": True,
-                },
-                cast_to=ChatCompletion,
-            )
+        response = await client.post(
+            "/chat/completions/tokens",
+            body={
+                "model": model_name,
+                "messages": [{"role": "user", "content": ""}],
+                "tokens": sample.prompt_ids + sample.completion_ids,
+                "max_tokens": 1,
+                "temperature": 1.0,
+                "top_p": 1.0,
+                "skip_special_tokens": False,
+                "prompt_logprobs": True,
+            },
+            cast_to=ChatCompletion,
+        )
         return [
             0.0 if lp is None else float(next(iter(lp.values()))["logprob"])
             for lp in getattr(response, "prompt_logprobs", [])

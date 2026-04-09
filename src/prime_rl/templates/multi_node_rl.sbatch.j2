@@ -62,13 +62,6 @@ mkdir -p $OUTPUT_DIR/logs/trainer $OUTPUT_DIR/logs/inference
 ln -sfn trainer/node_0.log $OUTPUT_DIR/logs/trainer.log
 ln -sfn inference/node_0.log $OUTPUT_DIR/logs/inference.log
 
-# Clear previous rollouts and broadcast flags from ALL runs (not just the current one)
-# to prevent the trainer from training on stale data from old run_* directories.
-# WARN: This is potentially dangerous and could lead to data loss
-rm -rf $OUTPUT_DIR/run_*/rollouts
-rm -rf $OUTPUT_DIR/run_*/broadcasts
-rm -rf $OUTPUT_DIR/rollouts
-
 # General
 export CUDA_DEVICE_ORDER=PCI_BUS_ID
 export PYTHONUNBUFFERED=1

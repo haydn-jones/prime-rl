@@ -1,3 +1,4 @@
+import math
 from pathlib import Path
 from typing import Annotated, Any, Literal, TypeAlias
 
@@ -67,58 +68,16 @@ class ModelConfig(BaseModelConfig):
     ] = None
 
 
-class TemperatureSchedulerConfig(BaseConfig):
-    """Configures temperature scheduling over training steps. Use this OR sampling.temperature, not both."""
-
-    type: Annotated[
-        Literal["linear", "cosine"],
-        Field(
-            description="Schedule shape. Linear interpolates linearly; cosine uses smooth, monotonic curve.",
-        ),
-    ] = "linear"
-
-    start_temperature: Annotated[
-        float,
-        Field(
-            ge=0,
-            description="Temperature at step 0.",
-        ),
-    ]
-
-    end_temperature: Annotated[
-        float,
-        Field(
-            ge=0,
-            description="Temperature at final step.",
-        ),
-    ]
-
-    total_steps: Annotated[
-        int | None,
-        Field(
-            ge=1,
-            description="Number of steps to reach end_temperature. Defaults to orchestrator max_steps if None.",
-        ),
-    ] = None
-
-
-class SamplingConfig(BaseConfig):
+class TrainSamplingConfig(BaseConfig):
     """Configures how tokens are sampled from the model for training. Largely follows the vLLM sampling parameters."""
 
     temperature: Annotated[
-        float | None,
+        float,
         Field(
             ge=0,
-            description="Constant temperature for sampling. Defaults to 1.0 if neither this nor temp_scheduler is set. Cannot be set together with temp_scheduler.",
+            description="Temperature for sampling.",
         ),
-    ] = None
-
-    temp_scheduler: Annotated[
-        TemperatureSchedulerConfig | None,
-        Field(
-            description="Temperature schedule over training steps. Set this OR temperature, not both.",
-        ),
-    ] = None
+    ] = 1.0
 
     repetition_penalty: Annotated[
         float,
@@ -160,168 +119,200 @@ class SamplingConfig(BaseConfig):
         ),
     ] = {}
 
+    def to_sampling_args(self) -> dict[str, Any]:
+        """Convert to OAI-compatible sampling args dict, omitting None values."""
+        # Top-level OAI params
+        args: dict[str, Any] = {
+            "temperature": self.temperature,
+            "top_p": 1.0,
+            "logprobs": True,
+        }
+        if self.max_completion_tokens is not None:
+            args["max_completion_tokens"] = self.max_completion_tokens
+        if self.seed is not None:
+            args["seed"] = self.seed
+
+        # vLLM extra_body params
+        extra_body = dict(self.extra_body)
+        if self.min_tokens > 0:
+            extra_body["min_tokens"] = self.min_tokens
+        if self.repetition_penalty != 1.0:
+            extra_body["repetition_penalty"] = self.repetition_penalty
+        if extra_body:
+            args["extra_body"] = extra_body
+
+        return args
+
     @model_validator(mode="before")
     @classmethod
     def _deprecate_max_tokens(cls, data: Any) -> Any:
         if isinstance(data, dict) and "max_tokens" in data and "max_completion_tokens" not in data:
-            get_logger().warning("'max_tokens' is deprecated, use 'max_completion_tokens' instead.")
+            get_logger().warning(
+                "'max_tokens' is deprecated, use 'max_completion_tokens' instead. "
+                "Auto-translating for now, but this will be removed in a future release."
+            )
         return data
 
 
 class EvalSamplingConfig(BaseConfig):
-    """Configures how tokens are sampled from the model for evaluation. Largely follows the vLLM sampling parameters."""
+    """Configures how tokens are sampled from the model for evaluation.
+
+    All sampling fields default to None, meaning the inference server's own
+    default is used. Only explicitly set fields are forwarded.
+    """
 
     temperature: Annotated[
         float | None,
-        Field(
-            ge=0,
-            description="Scales the output probability distribution. Lower values => more deterministic, higher values => more random. If 0, will sample greedily. Defaults to None, which means we fall back to the inference server's default value.",
-        ),
+        Field(ge=0, description="Sampling temperature. None defers to the inference server default."),
     ] = None
 
     repetition_penalty: Annotated[
         float | None,
-        Field(
-            ge=0,
-            description="Penalty for repeating tokens. Values > 1.0 discourage repetition, values < 1.0 encourage repetition, and 1.0 means no penalty. Defaults to None, which means we fall back to the inference server's default value.",
-        ),
+        Field(ge=0, description="Repetition penalty. None defers to the inference server default."),
     ] = None
 
     top_p: Annotated[
         float | None,
-        Field(
-            description="Cumulative probability of the top tokens to consider. If 1, all tokens are considered. Defaults to None, which means we fall back to the inference server's default value.",
-        ),
+        Field(description="Nucleus sampling threshold. None defers to the inference server default."),
     ] = None
 
     top_k: Annotated[
         int | None,
-        Field(
-            description="Number of top tokens to consider. If -1, all tokens are considered. Defaults to None, which means we fall back to the inference server's default value.",
-        ),
+        Field(description="Top-k sampling. None defers to the inference server default."),
     ] = None
 
     min_p: Annotated[
         float | None,
-        Field(
-            description="Minimum probability for a token to be considered, relative to the probability of the most likely token. If 0, all tokens are considered. Defaults to None, which means we fall back to the inference server's default value.",
-        ),
+        Field(ge=0, description="Min-p sampling threshold. None defers to the inference server default."),
     ] = None
 
     max_completion_tokens: Annotated[
         int | None,
         Field(
             validation_alias=AliasChoices("max_completion_tokens", "max_tokens"),
-            description="Maximum number of output tokens to generate per turn. If None, will generate until maximum context length or EOS token is hit.",
+            description="Maximum output tokens per turn. None defers to the inference server default.",
         ),
     ] = None
 
     min_tokens: Annotated[
         int | None,
-        Field(
-            description="Minimum number of output tokens to generate per sequence. Defaults to None, which means we fall back to the inference server's default value.",
-        ),
+        Field(ge=0, description="Minimum output tokens per sequence. None defers to the inference server default."),
     ] = None
 
     reasoning_effort: Annotated[
         Literal["minimal", "low", "medium", "high"] | None,
-        Field(
-            description="Constrains effort on reasoning for reasoning models. Currently supported values are minimal, low, medium, and high. Defaults to None, which means we fall back to the inference server's default value.",
-        ),
+        Field(description="Reasoning effort constraint for reasoning models."),
     ] = None
 
     seed: Annotated[
         int | None,
-        Field(
-            description="Random seed to use for sampling. If None, no seeding is used. Defaults to None, which means we fall back to the inference server's default value.",
-        ),
+        Field(description="Random seed for sampling. None means no seeding."),
     ] = None
 
-    # Strictly speaking, extra_body is not a sampling parameter, but it is the
-    # easiest way to pass arbitrary extra parameters to the server via verifiers
     extra_body: Annotated[
         dict[str, Any],
-        Field(
-            description="Extra body to use for the OpenAI API. By default, it is set to an empty dictionary.",
-        ),
+        Field(description="Extra body parameters forwarded to the inference server."),
     ] = {}
+
+    def to_sampling_args(self) -> dict[str, Any]:
+        """Convert to OAI-compatible sampling args dict. Only includes non-None fields."""
+        args: dict[str, Any] = {}
+        if self.temperature is not None:
+            args["temperature"] = self.temperature
+        if self.top_p is not None:
+            args["top_p"] = self.top_p
+        if self.max_completion_tokens is not None:
+            args["max_completion_tokens"] = self.max_completion_tokens
+        if self.reasoning_effort is not None:
+            args["reasoning_effort"] = self.reasoning_effort
+        if self.seed is not None:
+            args["seed"] = self.seed
+
+        extra_body = dict(self.extra_body)
+        if self.top_k is not None:
+            extra_body["top_k"] = self.top_k
+        if self.min_p is not None:
+            extra_body["min_p"] = self.min_p
+        if self.min_tokens is not None:
+            extra_body["min_tokens"] = self.min_tokens
+        if self.repetition_penalty is not None:
+            extra_body["repetition_penalty"] = self.repetition_penalty
+        if extra_body:
+            args["extra_body"] = extra_body
+
+        return args
 
     @model_validator(mode="before")
     @classmethod
     def _deprecate_max_tokens(cls, data: Any) -> Any:
         if isinstance(data, dict) and "max_tokens" in data and "max_completion_tokens" not in data:
-            get_logger().warning("'max_tokens' is deprecated, use 'max_completion_tokens' instead.")
+            get_logger().warning(
+                "'max_tokens' is deprecated, use 'max_completion_tokens' instead. "
+                "Auto-translating for now, but this will be removed in a future release."
+            )
         return data
 
 
-class EvalSaveHFConfig(BaseConfig):
-    """Configures how to save the eval results to HF."""
-
-    dataset_name: Annotated[
-        str | None,
-        Field(
-            description="The name of the HF dataset to save the eval results to. If None, will auto-generate a name."
-        ),
-    ] = None
-
-    dataset_subset: Annotated[
-        str | None,
-        Field(
-            description="The subset name of the HF dataset to save the evaluation results. If None, will default to the environment ID.",
-        ),
-    ] = None
-
-    dataset_split: Annotated[
-        str | None,
-        Field(
-            description="The split name of the HF dataset to save the evaluation results. If None, will default to 'evals'.",
-        ),
-    ] = None
-
-    private: Annotated[
-        bool,
-        Field(description="Whether to save the eval results to a private HF dataset."),
-    ] = False
-
-
 class EnvConfig(BaseConfig):
-    """Configures an environment for training."""
+    """Base environment configuration."""
 
-    id: Annotated[str, Field(description="ID of the environment to use.")] = "reverse-text"
-    args: Annotated[dict, Field(description="Arguments to pass to the environment.")] = {}
-    name: Annotated[str | None, Field(description="Name of the environment to use.")] = None
-    address: Annotated[
+    id: Annotated[
+        str,
+        Field(
+            description="Registered verifiers environment ID (e.g. 'math-env', 'primeintellect/math-env'). May include an @version suffix for installation."
+        ),
+    ] = "reverse-text"
+
+    name: Annotated[
         str | None,
         Field(
-            description="Address of the environment server. If None, will spawn an environment server in a subprocess automatically.If given, will try to connect an environment client to the environment server at this address."
+            description="Display name for this environment in logs, metrics, and buffer keys. Defaults to the id (without @version). Must be unique across all envs in the same group."
         ),
     ] = None
+
+    args: Annotated[
+        dict,
+        Field(
+            description="Keyword arguments forwarded to vf.load_environment. See the environment's docstring for accepted args."
+        ),
+    ] = {}
+
     extra_env_kwargs: Annotated[
         dict[str, Any],
         Field(
             description=(
-                "Extra kwargs passed to an env (e.g. seq_len, score_rollouts, max_total_completion_tokens). This field is auto-populated with the seq_len, and score_rollouts for training envs on the orchestrator and max_total_completion_tokens for all envs. It is generally NOT recommended for this field to be overriden by the user. It's main use case is to match the extra_env_kwargs when running an env in an isolated environment server."
+                "Extra kwargs passed to an env (e.g. seq_len, max_total_completion_tokens). This field is auto-populated on the orchestrator for all envs. It is generally NOT recommended for this field to be overriden by the user. It's main use case is to match the extra_env_kwargs when running an env in an isolated environment server."
             ),
         ),
     ] = {}
+
+    address: Annotated[
+        str | None,
+        Field(
+            description="ZMQ address of an external env server (e.g. 'tcp://host:5000'). When set, the orchestrator connects to this server instead of spawning one. When None (default), a subprocess env server is spawned automatically."
+        ),
+    ] = None
+
     num_workers: Annotated[
         int | Literal["auto"],
         Field(
-            description=(
-                "Number of env server worker processes. "
-                "Set to 'auto' to scale based on the env's concurrency (1 worker per 256 concurrent rollouts). "
-                "When setting manually, we recommend sizing so that each worker handles at most 256 concurrent rollouts. "
-                "Only used when the orchestrator spawns the env server (i.e. address is None)."
-            ),
+            description="Number of worker processes for the spawned env server. 'auto' scales to 1 worker per 256 concurrent rollouts. Ignored when address is set (external server)."
         ),
     ] = "auto"
+
+    ratio: Annotated[
+        float | None,
+        Field(
+            gt=0,
+            description="Sampling weight for this environment in the buffer. When None for all envs, samples uniformly across all available problems. When set, must be set on all envs — values are relative weights normalized to probabilities (e.g. [1, 1] and [0.5, 0.5] are equivalent).",
+        ),
+    ] = None
+
     max_retries: Annotated[
         int,
-        Field(
-            ge=0,
-            description="Maximum number of times the environment will retry a failed rollout.",
-        ),
+        Field(ge=0, description="Number of times the env server retries a failed rollout before returning an error."),
     ] = 0
+
     max_total_completion_tokens: Annotated[
         int,
         Field(
@@ -333,8 +324,13 @@ class EnvConfig(BaseConfig):
     ] = -1
 
     @property
+    def stripped_id(self) -> str:
+        """Environment ID without the @version suffix."""
+        return self.id.split("@")[0]
+
+    @property
     def resolved_name(self) -> str:
-        return self.name or self.id.split("@")[0]
+        return self.name or self.stripped_id
 
     @model_validator(mode="after")
     def validate_env_name(self):
@@ -350,53 +346,103 @@ class EnvConfig(BaseConfig):
         return self
 
 
+class TrainEnvConfig(EnvConfig):
+    """Configures a training environment."""
+
+    sampling: Annotated[
+        TrainSamplingConfig,
+        Field(
+            description="Per-env sampling overrides. Unset fields inherit from the group-level train sampling config.",
+        ),
+    ] = TrainSamplingConfig()
+
+
 class EvalEnvConfig(EnvConfig):
-    """Configures an environment for evaluation."""
+    """Configures an evaluation environment."""
+
+    sampling: Annotated[
+        EvalSamplingConfig,
+        Field(
+            description="Per-env sampling overrides. Unset fields inherit from the group-level eval sampling config.",
+        ),
+    ] = EvalSamplingConfig()
 
     num_examples: Annotated[
-        int | None,
-        Field(
-            description="Number of examples to evaluate per environment. If not set, will use 'num_examples' from main config."
-        ),
-    ] = None
-    rollouts_per_example: Annotated[
-        int | None,
-        Field(
-            description="Number of samples to generate per example for each environment. If not set, will use 'rollouts_per_example' from main config."
-        ),
-    ] = None
-
-    skip_first: Annotated[
         int,
         Field(
-            description="Number of examples to skip from the beginning of the dataset.",
+            description="Number of eval examples to sample from the dataset. Set to -1 to use all available examples."
         ),
-    ] = 0
+    ] = -1
 
-
-class ValConfig(BaseConfig):
-    """Configures the validation of the model."""
-
-    num_examples: Annotated[
-        int, Field(ge=1, description="Number of examples to use for validation. If -1, will use all examples.")
-    ] = 16
     rollouts_per_example: Annotated[
-        int, Field(ge=1, description="Number of samples to generate per example for validation.")
+        int,
+        Field(
+            ge=1,
+            description="Number of rollouts generated per example. Used for pass@k estimation (e.g. rollouts_per_example=8 enables pass@1 through pass@8).",
+        ),
     ] = 1
-    interval: Annotated[int, Field(description="Interval at which to validate the model.")] = 10
+
+
+class TrainConfig(BaseConfig):
+    """Configures training environments and their shared sampling settings."""
+
+    env: list[TrainEnvConfig] = [TrainEnvConfig()]
+
+    sampling: TrainSamplingConfig = TrainSamplingConfig()
+
+    @model_validator(mode="after")
+    def resolve_sampling(self):
+        """Resolve each env's sampling by merging group defaults with per-env overrides."""
+        group = self.sampling.model_dump()
+        for env in self.env:
+            if "sampling" not in env.model_fields_set:
+                env.sampling = TrainSamplingConfig(**group)
+            else:
+                merged = group.copy()
+                merged.update(env.sampling.model_dump(exclude_unset=True))
+                env.sampling = TrainSamplingConfig(**merged)
+        return self
+
+    @model_validator(mode="after")
+    def validate_unique_env_names(self):
+        env_names = [env.resolved_name for env in self.env]
+        duplicates = [n for n in env_names if env_names.count(n) > 1]
+        if duplicates:
+            raise ValueError(
+                f"Duplicate training environment names: {set(duplicates)}. Each env must have a unique name."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def validate_env_ratios(self):
+        ratios = [env.ratio for env in self.env]
+        if all(r is None for r in ratios):
+            return self
+        if any(r is None for r in ratios):
+            raise ValueError("Either all envs must have a ratio or none of them. Got a mix of set and unset ratios.")
+        return self
 
 
 class EvalConfig(BaseConfig):
     """Configures evaluation using verifiers environments."""
 
     env: list[EvalEnvConfig] = [EvalEnvConfig()]
+
     sampling: EvalSamplingConfig = Field(
         default_factory=EvalSamplingConfig,
         description="Shared sampling configuration for evals; can differ from training sampling.",
     )
-    num_examples: Annotated[int, Field(description="Number of examples to evaluate per environment.")] = -1
+
+    num_examples: Annotated[
+        int,
+        Field(
+            description="Default number of eval examples per environment. Set to -1 to use all. Can be overridden per env."
+        ),
+    ] = -1
+
     rollouts_per_example: Annotated[
-        int, Field(ge=1, description="Number of samples to generate per example for each environment.")
+        int,
+        Field(ge=1, description="Default number of rollouts per example. Can be overridden per env."),
     ] = 1
 
     interval: Annotated[
@@ -406,6 +452,46 @@ class EvalConfig(BaseConfig):
             description="Interval at which to evaluate the model.",
         ),
     ] = 100
+
+    @model_validator(mode="after")
+    def resolve_sampling(self):
+        """Resolve each env's sampling by merging group defaults with per-env overrides."""
+        group = self.sampling.model_dump()
+        for env in self.env:
+            if "sampling" not in env.model_fields_set:
+                env.sampling = EvalSamplingConfig(**group)
+            else:
+                merged = group.copy()
+                merged.update(env.sampling.model_dump(exclude_unset=True))
+                env.sampling = EvalSamplingConfig(**merged)
+        return self
+
+    @model_validator(mode="after")
+    def resolve_env_defaults(self):
+        """Fill per-env num_examples and rollouts_per_example from group defaults, then resolve num_workers."""
+        for env in self.env:
+            if "num_examples" not in env.model_fields_set:
+                env.num_examples = self.num_examples
+            if "rollouts_per_example" not in env.model_fields_set:
+                env.rollouts_per_example = self.rollouts_per_example
+            # Resolve num_workers now that num_examples and rollouts_per_example are set
+            if env.num_workers == "auto":
+                if env.num_examples == -1:
+                    env.num_workers = 4
+                else:
+                    max_concurrent = env.num_examples * env.rollouts_per_example
+                    env.num_workers = max(1, math.ceil(max_concurrent / 256))
+        return self
+
+    @model_validator(mode="after")
+    def validate_unique_env_names(self):
+        env_names = [env.resolved_name for env in self.env]
+        duplicates = [n for n in env_names if env_names.count(n) > 1]
+        if duplicates:
+            raise ValueError(
+                f"Duplicate evaluation environment names: {set(duplicates)}. Each env must have a unique name."
+            )
+        return self
 
     eval_base_model: Annotated[
         bool,
@@ -431,14 +517,6 @@ class EvalConfig(BaseConfig):
             description="Whether to cancel in-flight training rollouts before starting online evals. This is useful to avoid congestion (e.g. do not have training + eval rollouts happening at the same time) but leads to slower training steps as rollouts get cancelled and the pipeline has to fill up after each eval",
         ),
     ] = False
-
-    @model_validator(mode="after")
-    def validate_unique_env_names(self):
-        env_names = [env.resolved_name for env in self.env]
-        duplicates = [n for n in env_names if env_names.count(n) > 1]
-        if duplicates:
-            raise ValueError(f"Duplicate eval environment names: {set(duplicates)}. Each env must have a unique name.")
-        return self
 
 
 class CheckpointConfig(BaseConfig):
@@ -503,16 +581,6 @@ class BufferConfig(BaseConfig):
         ),
     ] = None
 
-    env_ratios: Annotated[
-        list[float] | None,
-        Field(
-            description=(
-                "Ratios for sampling from each environment. "
-                "If None, samples uniformly across all available problems (not environments)."
-            ),
-        ),
-    ] = None
-
     easy_threshold: Annotated[
         float | None,
         Field(
@@ -558,33 +626,13 @@ class BufferConfig(BaseConfig):
             min_length=1,
             description="Keys to use for computing example hashes. Will be used to match examples from buffer checkpoints and determine buffer resume behavior.",
         ),
-    ] = ["task", "prompt"]
+    ] = ["env_name", "prompt"]
 
     @model_validator(mode="after")
     def validate_thresholds(self):
         if self.easy_threshold is not None and self.hard_threshold is not None:
             assert self.easy_threshold > self.hard_threshold, "easy_threshold must be greater than hard_threshold."
         return self
-
-    @model_validator(mode="after")
-    def validate_env_ratios(self):
-        if self.env_ratios is not None:
-            assert all(ratio > 0 for ratio in self.env_ratios), "All env_ratios must be positive."
-        return self
-
-
-class VerificationConfig(BaseConfig):
-    """Configures rollout verification and rubric scoring."""
-
-    enabled: Annotated[
-        bool,
-        Field(
-            description=(
-                "Whether to verify training rollouts using the environment rubric. "
-                "If False, rewards are always set to 0."
-            ),
-        ),
-    ] = True
 
 
 class DefaultAdvantageConfig(BaseModel):
@@ -737,6 +785,9 @@ class TeacherRolloutModelConfig(BaseConfig):
 class OrchestratorConfig(BaseConfig):
     """Configures the orchestrator for RL training."""
 
+    # Training environments and sampling
+    train: TrainConfig = TrainConfig()
+
     # The OAI client configuration
     client: ClientConfig = ClientConfig()
 
@@ -767,20 +818,11 @@ class OrchestratorConfig(BaseConfig):
         ),
     ] = None
 
-    # The sampling configuration
-    sampling: SamplingConfig = SamplingConfig()
-
-    # The environment configuration
-    env: list[EnvConfig] = [EnvConfig()]
-
     # The evaluation configuration
     eval: EvalConfig | None = None
 
     # Data buffer configuration
     buffer: BufferConfig = BufferConfig()
-
-    # Rollout verification configuration
-    verification: VerificationConfig = VerificationConfig()
 
     # The advantage configuration
     advantage: AdvantageConfig | None = DefaultAdvantageConfig()
@@ -800,9 +842,6 @@ class OrchestratorConfig(BaseConfig):
     # The checkpoint configuration
     ckpt: CheckpointConfig | None = None
 
-    # The validation configuration
-    val: ValConfig | None = None
-
     weight_broadcast: WeightBroadcastConfig = FileSystemWeightBroadcastConfig()
 
     rollout_transport: TransportConfig = FileSystemTransportConfig()
@@ -813,13 +852,6 @@ class OrchestratorConfig(BaseConfig):
             description="Directory to write outputs to. Will be populated with checkpoints, weights, rollouts and logs as subdirectories. Should be set to a persistent directory with enough disk space. This value should be distinct across experiments running on a single node. See the README for more details."
         ),
     ] = Path("outputs/run_default")
-
-    max_concurrent: Annotated[
-        int | None,
-        Field(
-            description="Maximum number of concurrent rollouts to generate and score per-environment. If None, will not limit concurrency.",
-        ),
-    ] = None
 
     tasks_per_minute: Annotated[
         int | None,
@@ -939,17 +971,34 @@ class OrchestratorConfig(BaseConfig):
         ),
     ] = True
 
+    @model_validator(mode="before")
+    @classmethod
+    def _env_to_train(cls, data: Any) -> Any:
+        """Allow [[env]] and [sampling] as shorthand for [train] with [[train.env]] and [train.sampling]."""
+        if not isinstance(data, dict):
+            return data
+        if "env" in data or "sampling" in data:
+            train = data.setdefault("train", {})
+            if isinstance(train, dict):
+                if "env" in data:
+                    get_logger().warning(
+                        "'[[orchestrator.env]]' is deprecated, use '[[orchestrator.train.env]]' instead. "
+                        "Auto-translating for now, but this will be removed in a future release."
+                    )
+                    train.setdefault("env", data.pop("env"))
+                if "sampling" in data:
+                    get_logger().warning(
+                        "'[orchestrator.sampling]' is deprecated, use '[orchestrator.train.sampling]' instead. "
+                        "Auto-translating for now, but this will be removed in a future release."
+                    )
+                    train.setdefault("sampling", data.pop("sampling"))
+        return data
+
     @model_validator(mode="after")
     def validate_unique_filter_types(self):
         types = [f.type for f in self.filters]
         if len(types) != len(set(types)):
             raise ValueError(f"Duplicate filter types: {types}. Each filter type may only appear once.")
-        return self
-
-    @model_validator(mode="after")
-    def validate_max_concurrent(self):
-        if self.max_concurrent is not None and self.max_concurrent < self.rollouts_per_example:
-            raise ValueError("max_concurrent must be at least the number of rollouts per example")
         return self
 
     @model_validator(mode="after")
@@ -989,42 +1038,13 @@ class OrchestratorConfig(BaseConfig):
 
         if self.max_inflight_rollouts is not None and self.max_inflight_rollouts < self.rollouts_per_example:
             raise ValueError("max_inflight_rollouts must be at least the number of rollouts per example")
-        return self
 
-    @model_validator(mode="after")
-    def validate_unique_env_names(self):
-        env_names = [env.resolved_name for env in self.env]
-        duplicates = [n for n in env_names if env_names.count(n) > 1]
-        if duplicates:
-            raise ValueError(f"Duplicate environment names: {set(duplicates)}. Each env must have a unique name.")
-        return self
+        # Resolve train env num_workers from max_inflight_rollouts
+        for env_cfg in self.train.env:
+            if env_cfg.num_workers == "auto":
+                assert self.max_inflight_rollouts is not None
+                env_cfg.num_workers = max(1, math.ceil(self.max_inflight_rollouts / 256))
 
-    @model_validator(mode="after")
-    def validate_env_ratios(self):
-        if self.buffer.env_ratios is not None:
-            assert len(self.buffer.env_ratios) == len(self.env), "env_ratios length must match number of environments"
-        return self
-
-    @model_validator(mode="after")
-    def validate_verification_config(self):
-        if self.verification.enabled:
-            return self
-
-        if self.buffer.online_difficulty_filtering:
-            raise ValueError(
-                "verification.enabled cannot be False when buffer.online_difficulty_filtering is True. "
-                "These features depend on rewards which are disabled when verification.enabled=False."
-            )
-        if self.buffer.easy_threshold is not None:
-            raise ValueError(
-                "verification.enabled cannot be False when buffer.easy_threshold is set. "
-                "Easy threshold depends on rewards which are disabled when verification.enabled=False."
-            )
-        if self.buffer.hard_threshold is not None:
-            raise ValueError(
-                "verification.enabled cannot be False when buffer.hard_threshold is set. "
-                "Hard threshold depends on rewards which are disabled when verification.enabled=False."
-            )
         return self
 
     @model_validator(mode="after")
@@ -1050,32 +1070,13 @@ class OrchestratorConfig(BaseConfig):
         return self
 
     @model_validator(mode="after")
-    def resolve_extra_env_kwargs(self):
-        train_extra_env_kwargs = dict(
-            max_seq_len=self.seq_len,
-            score_rollouts=self.verification.enabled,
-        )
-        for env in self.env:
-            # extra_env_kwargs is not meant to be used by the user, we shamelessly override here
-            env.extra_env_kwargs.update(train_extra_env_kwargs)
-
-        return self
-
-    @model_validator(mode="after")
-    def validate_temperature_config(self):
-        has_temp = self.sampling.temperature is not None
-        has_scheduler = self.sampling.temp_scheduler is not None
-
-        if has_temp and has_scheduler:
-            raise ValueError("Set either sampling.temperature OR sampling.temp_scheduler, not both")
-
-        # Default to temperature=1.0 if neither is set
-        if not has_temp and not has_scheduler:
-            self.sampling.temperature = 1.0
-
-        if has_scheduler:
-            scheduler = self.sampling.temp_scheduler
-            if scheduler.total_steps is None and self.max_steps is None:
-                raise ValueError("temp_scheduler.total_steps must be set when max_steps is None")
-
+    def resolve_env_config(self):
+        """Populate extra_env_kwargs and vLLM sampling defaults from top-level fields."""
+        is_vllm = self.teacher_rollout_model is None
+        for env in self.train.env:
+            env.extra_env_kwargs.update(max_seq_len=self.seq_len)
+            if is_vllm:
+                env.sampling.extra_body.setdefault("top_k", -1)
+                env.sampling.extra_body.setdefault("min_p", 0.0)
+                env.sampling.extra_body.setdefault("return_token_ids", True)
         return self

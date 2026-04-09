@@ -14,8 +14,14 @@ import tomli_w
 
 from prime_rl.configs.rl import RLConfig
 from prime_rl.utils.config import cli
-from prime_rl.utils.logger import setup_logger
-from prime_rl.utils.pathing import format_log_message, validate_output_dir
+from prime_rl.utils.logger import get_logger, setup_logger
+from prime_rl.utils.pathing import (
+    clean_future_steps,
+    format_log_message,
+    get_ckpt_dir,
+    resolve_latest_ckpt_step,
+    validate_output_dir,
+)
 from prime_rl.utils.process import cleanup_processes, cleanup_threads, monitor_process, set_proc_title
 from prime_rl.utils.utils import (
     get_free_port,
@@ -482,7 +488,7 @@ def rl_slurm(config: RLConfig):
         write_config(config, config_dir, exclude={"slurm", "dry_run", "clean_output_dir"})
         logger.info(f"Wrote config to {config_dir / RL_TOML}")
 
-        train_env_names = [env.resolved_name for env in config.orchestrator.env]
+        train_env_names = [env.resolved_name for env in config.orchestrator.train.env]
         eval_env_names = [env.resolved_name for env in config.orchestrator.eval.env] if config.orchestrator.eval else []
 
         log_message = format_log_message(
@@ -497,7 +503,7 @@ def rl_slurm(config: RLConfig):
         write_subconfigs(config, config_dir)
         logger.info(f"Wrote subconfigs to {config_dir}")
 
-        train_env_names = [env.resolved_name for env in config.orchestrator.env]
+        train_env_names = [env.resolved_name for env in config.orchestrator.train.env]
         eval_env_names = [env.resolved_name for env in config.orchestrator.eval.env] if config.orchestrator.eval else []
 
         has_infer = config.deployment.num_infer_nodes > 0
@@ -537,6 +543,16 @@ def rl(config: RLConfig):
     config.output_dir.mkdir(parents=True, exist_ok=True)
     if ckpt_output_dir is not None:
         ckpt_output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Clean stale artifacts from steps after the resume point
+    if resuming:
+        resume_step = config.ckpt.resume_step
+        if resume_step == -1:
+            ckpt_base = ckpt_output_dir if ckpt_output_dir is not None else config.output_dir
+            resume_step = resolve_latest_ckpt_step(get_ckpt_dir(ckpt_base))
+        if resume_step is not None:
+            get_logger().info(f"Resuming from step {resume_step}, cleaning future rollouts and broadcasts")
+            clean_future_steps(config.output_dir, resume_step)
 
     if config.slurm is not None:
         rl_slurm(config)

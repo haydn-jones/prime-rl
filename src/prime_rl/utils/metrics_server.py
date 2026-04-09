@@ -195,7 +195,7 @@ class MetricsServer(HealthServer):
         step: int,
         loss: float,
         throughput: float,
-        grad_norm: float,
+        grad_norm: float | None,
         peak_memory_gib: float,
         learning_rate: float,
         mfu: float = 0.0,
@@ -207,7 +207,8 @@ class MetricsServer(HealthServer):
         self._step.set(step)
         self._loss.set(loss)
         self._throughput.set(throughput)
-        self._grad_norm.set(grad_norm)
+        if grad_norm is not None:
+            self._grad_norm.set(grad_norm)
         self._peak_mem.set(peak_memory_gib)
         self._lr.set(learning_rate)
         self._mfu.set(mfu)

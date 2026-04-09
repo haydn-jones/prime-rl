@@ -7,7 +7,7 @@ from prime_rl.utils.config import cli
 from prime_rl.utils.logger import setup_logger
 from prime_rl.utils.pathing import get_log_dir
 from prime_rl.utils.process import set_proc_title
-from prime_rl.utils.utils import clean_exit, get_env_ids_to_install, install_env, strip_env_version
+from prime_rl.utils.utils import clean_exit, get_env_ids_to_install, install_env
 
 
 @clean_exit
@@ -23,7 +23,7 @@ def run_server(config: EnvServerConfig):
     log_dir = (get_log_dir(config.output_dir) / config.env.resolved_name).as_posix()
 
     server = ZMQEnvServer(
-        env_id=strip_env_version(config.env.id),
+        env_id=config.env.stripped_id,
         env_args=config.env.args,
         extra_env_kwargs=config.env.extra_env_kwargs,
         log_level=config.log.level,

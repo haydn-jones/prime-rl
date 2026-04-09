@@ -149,6 +149,26 @@ def validate_output_dir(output_dir: Path, *, resuming: bool, clean: bool, ckpt_o
             )
 
 
+def clean_future_steps(output_dir: Path, resume_step: int) -> None:
+    """Remove stale rollouts and broadcasts from a resumed run."""
+    run_default = output_dir / "run_default"
+    dirs = [
+        get_rollout_dir(output_dir),
+        get_rollout_dir(run_default),
+        get_broadcast_dir(run_default),
+    ]
+
+    for directory in dirs:
+        steps_to_delete = [step for step in get_all_ckpt_steps(directory) if step > resume_step]
+        if not steps_to_delete:
+            continue
+        get_logger().info(
+            f"Deleting {len(steps_to_delete)} step directories in {directory} ({','.join(map(str, steps_to_delete))})"
+        )
+        for step in steps_to_delete:
+            shutil.rmtree(get_step_path(directory, step))
+
+
 def sync_wait_for_path(path: Path, interval: int = 1, log_interval: int = 10) -> None:
     logger = get_logger()
     wait_time = 0

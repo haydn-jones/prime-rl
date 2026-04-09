@@ -7,7 +7,8 @@ from threading import Event, Thread
 
 import psutil
 import setproctitle
-from loguru import logger
+
+from prime_rl.utils.logger import get_logger
 
 PRIME_RL_PROC_PREFIX = "PRIME-RL"
 
@@ -58,7 +59,7 @@ def cleanup_processes(processes: list[Popen]):
             process.wait(timeout=60)
         except subprocess.TimeoutExpired:
             cleanup_process(process.pid, signal.SIGKILL)
-        logger.debug(f"Cleaned up process {process.pid}")
+        get_logger().debug(f"Cleaned up process {process.pid}")
 
 
 def monitor_process(process: Popen, stop_event: Event, error_queue: list, process_name: str):

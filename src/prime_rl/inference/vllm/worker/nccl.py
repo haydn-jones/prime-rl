@@ -4,7 +4,6 @@ from typing import TYPE_CHECKING, Callable, Generator, cast
 import torch
 from torch.nn import Module
 from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator
-from vllm.distributed.parallel_state import get_dp_group, get_tp_group
 from vllm.distributed.utils import StatelessProcessGroup
 from vllm.logger import init_logger
 
@@ -14,6 +13,7 @@ from prime_rl.inference.vllm.worker.weight_transfer import (
     postprocess_weights_checkpoint,
     postprocess_weights_kernel,
 )
+from prime_rl.utils.nccl import disable_nccl_p2p_if_unavailable
 
 # This is to get type hints for the Worker class but not actually extend it at runtime as this is required by vLLM worker extension
 if TYPE_CHECKING:
@@ -73,6 +73,7 @@ class NCCLWeightBroadcastReceiver:
         timeout: int,
     ):
         logger.info(f"Initializing NCCL broadcast receiver ({host}:{port}, rank={rank}, world_size={world_size})")
+        disable_nccl_p2p_if_unavailable()
 
         pg = StatelessProcessGroup.create(host=host, port=port, rank=rank, world_size=world_size, store_timeout=timeout)
         self.communicator = PyNcclCommunicator(pg, device=device)
@@ -98,7 +99,6 @@ class NCCLWeightUpdateWorker(Worker):
         port: int,
         rank_offset: int,
         inference_world_size: int,
-        gpus_per_server: int,
         timeout: int,
         quantize_in_weight_transfer: bool = False,
     ) -> None:
@@ -107,20 +107,17 @@ class NCCLWeightUpdateWorker(Worker):
         Args:
             rank_offset: Starting GPU offset for this server in the global inference group.
             inference_world_size: Total number of inference GPUs across all servers.
-            gpus_per_server: Number of GPUs managed by this server instance.
         """
         self.quantize_in_weight_transfer = quantize_in_weight_transfer
-        tp_size = get_tp_group().world_size
-        tp_rank = get_tp_group().rank_in_group
-        dp_rank = get_dp_group().rank_in_group
-        # Use modulo to get the local DP rank within this server (needed when
-        # the DP group spans multiple nodes in distributed EP mode).
-        local_dp_rank = dp_rank % (gpus_per_server // tp_size)
-        local_rank = local_dp_rank * tp_size + tp_rank
+        # Use the worker's device index directly as the local rank.
+        # The previous dp_group-based computation broke in vLLM v1 multiprocess
+        # DP mode where each worker is a separate process with a singleton
+        # DP group (rank_in_group is always 0).
+        local_rank = self.device.index
         global_rank_inference = rank_offset + local_rank
 
         logger.info(
-            f"Worker [tp={tp_rank} dp={dp_rank} local_dp={local_dp_rank} rank_offset={rank_offset}] "
+            f"Worker [local_rank={local_rank} rank_offset={rank_offset}] "
             f"-> [global_rank={global_rank_inference} inference_world_size={inference_world_size}]"
         )
 

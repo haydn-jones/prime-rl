@@ -4,19 +4,17 @@ import asyncio
 import time
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
-from typing import NamedTuple, cast
 
 import verifiers as vf
 from aiolimiter import AsyncLimiter
 
 from prime_rl.configs.orchestrator import OrchestratorConfig
 from prime_rl.orchestrator.buffer import Buffer
-from prime_rl.orchestrator.utils import get_sampling_args
-from prime_rl.orchestrator.vf_utils import get_seq_len, run_rollout
+from prime_rl.orchestrator.envs import TrainEnvs
+from prime_rl.orchestrator.vf_utils import get_seq_len
 from prime_rl.utils.async_utils import safe_cancel, safe_cancel_all
 from prime_rl.utils.client import InferencePool
 from prime_rl.utils.logger import ProgressTracker, get_logger
-from prime_rl.utils.temp_scheduling import compute_temperature
 from prime_rl.utils.utils import (
     get_broadcast_dir,
     get_latest_ckpt_step,
@@ -25,13 +23,15 @@ from prime_rl.utils.utils import (
 )
 
 
-class InflightRolloutInfo(NamedTuple):
+@dataclass
+class InflightRequest:
     """Metadata for an in-flight request."""
 
     off_policy_steps: int
     client_config: vf.ClientConfig
-    task: str
+    env_name: str
     group_id: int | None = None
+    rollout_count: int = 1
 
 
 @dataclass
@@ -57,7 +57,7 @@ class Scheduler:
 
     def __init__(
         self,
-        env: vf.Environment,
+        train_envs: TrainEnvs,
         inference_pool: InferencePool,
         buffer: Buffer,
         config: OrchestratorConfig,
@@ -68,14 +68,13 @@ class Scheduler:
         tasks_per_minute: int | None,
         enable_policy_updates: bool = True,
         lora_name: str | None = None,
-        deferred_group_scoring_tasks: set[str] | None = None,
     ):
         self.logger = get_logger()
         if tasks_per_minute is not None:
             self.rate_limiter = AsyncLimiter(max_rate=tasks_per_minute, time_period=60)
         else:
             self.rate_limiter = None
-        self.env = env
+        self.train_envs = train_envs
         self.buffer = buffer
         self.config = config
         self.batch_size = config.batch_size
@@ -87,23 +86,18 @@ class Scheduler:
         self.strict_async_level = strict_async_level
         self.enable_policy_updates = enable_policy_updates
         self.lora_name = lora_name
-        initial_temp = compute_temperature(step=0, sampling_config=config.sampling, max_steps=config.max_steps)
-        is_vllm = config.teacher_rollout_model is None
-        self.sampling_args = get_sampling_args(config.sampling, temperature=initial_temp, is_vllm=is_vllm)
         self.model_name = self.config.model.name
         self.json_logging = config.log.json_logging
 
         # Inference pool - used for admin operations (adapter sync) and metrics
         self.inference_pool = inference_pool
 
-        self.max_retries_by_task = {env.resolved_name: env.max_retries for env in config.env}
-        self.deferred_group_scoring_tasks = set(deferred_group_scoring_tasks or ())
-        if self.deferred_group_scoring_tasks:
-            task_list = ", ".join(sorted(self.deferred_group_scoring_tasks))
-            self.logger.info(f"Deferred group scoring active for task(s): {task_list}")
+        group_scoring_envs = [env.name for env in train_envs if env.requires_group_scoring]
+        if group_scoring_envs:
+            self.logger.info(f"Group rollout scoring active for env(s): {', '.join(group_scoring_envs)}")
 
         # Track in-flight requests: task -> info
-        self.inflight_requests: dict[asyncio.Task, InflightRolloutInfo] = {}
+        self.inflight_requests: dict[asyncio.Task, InflightRequest] = {}
 
         # Track in-progress groups while rollouts are generated independently.
         self.next_group_id = 0
@@ -117,9 +111,9 @@ class Scheduler:
         self.inflight_policy_update_task: asyncio.Task | None = None
         self.policy_update_lock = asyncio.Lock()
         self.cancelled_rollouts_count = 0
-        self.empty_rollouts_by_task: dict[str, int] = defaultdict(int)
-        self.errored_rollouts_by_task: dict[str, int] = defaultdict(int)
-        self.total_rollouts_by_task: dict[str, int] = defaultdict(int)
+        self.empty_rollouts_by_env: dict[str, int] = defaultdict(int)
+        self.errored_rollouts_by_env: dict[str, int] = defaultdict(int)
+        self.total_rollouts_by_env: dict[str, int] = defaultdict(int)
         self.last_batch_generation_time = 0.0
 
     @property
@@ -144,13 +138,9 @@ class Scheduler:
             return rollouts
         return rollouts[: self.batch_size]
 
-    def set_sampling_args(self, sampling_args: dict) -> None:
-        """Update sampling args for future rollout requests."""
-        self.sampling_args = sampling_args
-
     async def cancel_inflight_rollouts(self):
         """Cancel all in-flight rollout requests."""
-        count = len(self.inflight_requests)
+        count = sum(info.rollout_count for info in self.inflight_requests.values())
         await safe_cancel_all(list(self.inflight_requests))
         self.inflight_requests.clear()
         self.groups.clear()
@@ -174,25 +164,27 @@ class Scheduler:
         return min(clients, key=lambda c: inflight[self._client_identity(c)])
 
     async def drop_group(self, group_id: int) -> int:
-        """Drop a group and cancel any remaining in-flight rollouts for it."""
+        """Drop a group and cancel any remaining in-flight rollouts for it. Returns the number of cancelled rollouts."""
         tasks_to_cancel = []
+        rollout_count = 0
         for task, info in list(self.inflight_requests.items()):
             if info.group_id != group_id:
                 continue
             self.inflight_requests.pop(task, None)
             tasks_to_cancel.append(task)
+            rollout_count += info.rollout_count
         self.groups.pop(group_id, None)
         await safe_cancel_all(tasks_to_cancel)
-        return len(tasks_to_cancel)
+        return rollout_count
 
     async def schedule_rollout(self, group_id: int):
-        """Asynchronously schedules a rollout request."""
+        """Asynchronously schedules a rollout request (or a group request for group-scoring envs)."""
         if self.rate_limiter:
             await self.rate_limiter.acquire()
         group = self.groups.get(group_id)
         if group is None or group.rollouts_to_schedule <= 0:
             return
-        group.rollouts_to_schedule -= 1
+
         if group.pinned_client is not None:
             client_config = group.pinned_client
         else:
@@ -200,27 +192,47 @@ class Scheduler:
             if group_id not in self.groups:
                 return
             group.pinned_client = client_config
-        run_rollout_task = asyncio.create_task(
-            run_rollout(
-                env=self.env,
-                client=client_config,
-                example=group.example,
-                model_name=self.model_name,
-                sampling_args=self.sampling_args,
-                max_retries=self.max_retries_by_task.get(group.example["task"], 0),
+
+        env_name = group.example["env_name"]
+        env = self.train_envs.get(env_name)
+
+        if env.requires_group_scoring:
+            rollout_count = group.rollouts_to_schedule
+            group.rollouts_to_schedule = 0
+            task = asyncio.create_task(
+                env.run_group(
+                    client=client_config,
+                    example=group.example,
+                    model_name=self.model_name,
+                    rollouts_per_example=rollout_count,
+                )
             )
-        )
-        self.inflight_requests[run_rollout_task] = InflightRolloutInfo(
-            off_policy_steps=0, client_config=client_config, task=group.example["task"], group_id=group_id
+        else:
+            rollout_count = 1
+            group.rollouts_to_schedule -= 1
+            task = asyncio.create_task(
+                env.run_rollout(
+                    client=client_config,
+                    example=group.example,
+                    model_name=self.model_name,
+                )
+            )
+        self.inflight_requests[task] = InflightRequest(
+            off_policy_steps=0,
+            client_config=client_config,
+            env_name=env_name,
+            group_id=group_id,
+            rollout_count=rollout_count,
         )
 
     @property
     def inflight_rollout_count(self) -> int:
-        return len(self.inflight_requests)
+        return sum(info.rollout_count for info in self.inflight_requests.values())
 
     @property
     def inflight_sample_count(self) -> int:
-        return self.inflight_rollout_count + sum(g.rollouts_to_schedule for g in self.groups.values())
+        pending = sum(g.rollouts_to_schedule for g in self.groups.values())
+        return self.inflight_rollout_count + pending
 
     async def _schedule_next_request(self) -> bool:
         remaining_capacity = self.max_inflight_rollouts - self.inflight_rollout_count
@@ -229,9 +241,16 @@ class Scheduler:
             return False
 
         for group_id, group in self.groups.items():
-            if group.rollouts_to_schedule > 0:
+            if group.rollouts_to_schedule <= 0:
+                continue
+            env = self.train_envs.get(group.example["env_name"])
+            cost = group.rollouts_to_schedule if env.requires_group_scoring else 1
+            if cost <= remaining_capacity:
                 await self.schedule_rollout(group_id=group_id)
                 return True
+
+        if remaining_capacity < self.rollouts_per_example:
+            return False
 
         example = self.buffer.sample_examples(n=1)[0]
         group_id = self.next_group_id
@@ -339,7 +358,7 @@ class Scheduler:
             info = self.inflight_requests.get(task)
             if info is None:
                 continue
-            self.inflight_requests[task] = info._replace(off_policy_steps=info.off_policy_steps + 1)
+            info.off_policy_steps += 1
 
         self.cancelled_rollouts_count += removed
         if removed:
@@ -347,19 +366,6 @@ class Scheduler:
                 f"Cancelled {removed} old rollout requests (will refill naturally). "
                 f"Consider increasing max_off_policy_steps to avoid this."
             )
-
-    def _should_defer_group_scoring(self, task: str) -> bool:
-        return task in self.deferred_group_scoring_tasks and self.config.verification.enabled
-
-    async def _score_group_if_deferred(self, completed_rollouts: list[vf.RolloutOutput]) -> list[vf.RolloutOutput]:
-        if not completed_rollouts:
-            return completed_rollouts
-        task = completed_rollouts[0]["task"]
-        if not self._should_defer_group_scoring(task):
-            return completed_rollouts
-        env_for_task = self.env.get_env_for_task(task)
-        await env_for_task.rubric.score_group(cast(list[vf.State], completed_rollouts))
-        return completed_rollouts
 
     async def generate_batch(self, step: int) -> list[vf.RolloutOutput]:
         """Continuously generates a batch of rollouts."""
@@ -407,40 +413,54 @@ class Scheduler:
                     continue
 
                 group_id = rollout_info.group_id
+                env_name = rollout_info.env_name
 
                 try:
                     group = self.groups.get(group_id)
                     if group is None:
                         continue
-                    rollout = finished_task.result()
 
-                    task = rollout_info.task
-                    self.total_rollouts_by_task[task] += 1
-                    should_reschedule = False
-                    if len(rollout["trajectory"]) == 0:
-                        self.empty_rollouts_by_task[task] += 1
-                        should_reschedule = True
-                        self.logger.warning(
-                            f"Empty trajectory in group {group_id} ({task}), re-scheduling "
-                            f"({len(group.completed_rollouts)}/{self.rollouts_per_example} complete)"
-                        )
-                    if rollout["error"] is not None:
-                        self.errored_rollouts_by_task[task] += 1
-                        should_reschedule = True
-                        self.logger.warning(
-                            f"Rollout error in group {group_id} ({task}), re-scheduling "
-                            f"({len(group.completed_rollouts)}/{self.rollouts_per_example} complete): "
-                            f"{rollout['error']['error_chain_repr']}"
-                        )
-                    if should_reschedule:
-                        group.rollouts_to_schedule += 1
+                    env = self.train_envs.get(env_name)
+                    result = finished_task.result()
+                    rollouts: list[vf.RolloutOutput] = result if isinstance(result, list) else [result]
+                    self.total_rollouts_by_env[env_name] += len(rollouts)
+
+                    # Check for empty/errored rollouts and reschedule
+                    valid_rollouts = []
+                    has_failures = False
+                    for rollout in rollouts:
+                        if len(rollout["trajectory"]) == 0:
+                            self.empty_rollouts_by_env[env_name] += 1
+                            has_failures = True
+                            self.logger.warning(
+                                f"Empty trajectory in group {group_id} ({env_name}), re-scheduling "
+                                f"({len(group.completed_rollouts)}/{self.rollouts_per_example} complete)"
+                            )
+                        elif rollout["error"] is not None:
+                            self.errored_rollouts_by_env[env_name] += 1
+                            has_failures = True
+                            self.logger.warning(
+                                f"Rollout error in group {group_id} ({env_name}), re-scheduling "
+                                f"({len(group.completed_rollouts)}/{self.rollouts_per_example} complete): "
+                                f"{rollout['error']['error_chain_repr']}"
+                            )
+                        else:
+                            rollout["env_name"] = env_name
+                            valid_rollouts.append(rollout)
+
+                    if has_failures and env.requires_group_scoring:
+                        # Group scoring requires all rollouts — discard partial results, reschedule full group
+                        group.completed_rollouts.clear()
+                        group.rollouts_to_schedule = self.rollouts_per_example
                         continue
 
-                    group.completed_rollouts.append(rollout)
+                    # For individual scoring, reschedule only the failed ones
+                    group.rollouts_to_schedule += len(rollouts) - len(valid_rollouts)
+                    group.completed_rollouts.extend(valid_rollouts)
                     if len(group.completed_rollouts) < self.rollouts_per_example:
                         continue
                     completed_rollouts = self.groups.pop(group_id).completed_rollouts
-                    completed_rollouts = await self._score_group_if_deferred(completed_rollouts)
+
                 except asyncio.CancelledError:
                     if group_id is not None:
                         await self.drop_group(group_id)
@@ -494,7 +514,7 @@ class Scheduler:
         return self.step - self.ckpt_step
 
     def get_metrics(self) -> dict[str, float]:
-        total_rollouts = sum(self.total_rollouts_by_task.values())
+        total_rollouts = sum(self.total_rollouts_by_env.values())
         metrics = {
             "time/wait_for_ckpt": self.wait_for_ckpt_time,
             "time/update_weights": self.update_weights_time,
@@ -502,25 +522,25 @@ class Scheduler:
             "scheduler/inflight_rollouts": self.inflight_rollout_count,
             "scheduler/inflight_samples": self.inflight_sample_count,
             "scheduler/cancelled_rollouts": self.cancelled_rollouts_count,
-            "empty_rollouts/all": sum(self.empty_rollouts_by_task.values()) / max(total_rollouts, 1),
-            "errored_rollouts/all": sum(self.errored_rollouts_by_task.values()) / max(total_rollouts, 1),
+            "empty_rollouts/all": sum(self.empty_rollouts_by_env.values()) / max(total_rollouts, 1),
+            "errored_rollouts/all": sum(self.errored_rollouts_by_env.values()) / max(total_rollouts, 1),
             "off_policy_level/all/max": self.max_off_policy_level,
             "off_policy_level/all/mean": self.mean_off_policy_level,
         }
-        for task in self.total_rollouts_by_task:
-            task_total = max(self.total_rollouts_by_task[task], 1)
-            metrics[f"empty_rollouts/{task}"] = self.empty_rollouts_by_task.get(task, 0) / task_total
-            metrics[f"errored_rollouts/{task}"] = self.errored_rollouts_by_task.get(task, 0) / task_total
-        by_task: dict[str, list[int]] = {}
+        for env_name in self.total_rollouts_by_env:
+            env_total = max(self.total_rollouts_by_env[env_name], 1)
+            metrics[f"empty_rollouts/{env_name}"] = self.empty_rollouts_by_env.get(env_name, 0) / env_total
+            metrics[f"errored_rollouts/{env_name}"] = self.errored_rollouts_by_env.get(env_name, 0) / env_total
+        by_env: dict[str, list[int]] = {}
         for info in self.inflight_requests.values():
-            by_task.setdefault(info.task, []).append(info.off_policy_steps)
-        for task, steps in by_task.items():
-            metrics[f"off_policy_level/{task}/max"] = max(steps)
-            metrics[f"off_policy_level/{task}/mean"] = sum(steps) / len(steps)
+            by_env.setdefault(info.env_name, []).append(info.off_policy_steps)
+        for env_name, steps in by_env.items():
+            metrics[f"off_policy_level/{env_name}/max"] = max(steps)
+            metrics[f"off_policy_level/{env_name}/mean"] = sum(steps) / len(steps)
         self.cancelled_rollouts_count = 0
-        self.empty_rollouts_by_task.clear()
-        self.errored_rollouts_by_task.clear()
-        self.total_rollouts_by_task.clear()
+        self.empty_rollouts_by_env.clear()
+        self.errored_rollouts_by_env.clear()
+        self.total_rollouts_by_env.clear()
 
         # Add inference pool metrics (e.g. elastic pool server counts)
         metrics.update(self.inference_pool.get_metrics())

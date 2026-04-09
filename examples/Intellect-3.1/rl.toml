@@ -50,30 +50,34 @@ oversampling_factor = 2
 [[orchestrator.env]]
 id = "mini-swe-agent-plus"
 name = "swe"
+ratio = 0.3
 args = { max_turns = 200, cpu_cores = 2,  memory_gb = 4, disk_size_gb = 4, labels = ["mini-swe-agent-plus"], total_timeout_minutes = 720, sandbox_client_max_workers = 256, max_command_timeouts = 3, sandbox_command_timeout = 30}
 
 [[orchestrator.env]]
 id = "deepdive"
 name = "deepdive"
+ratio = 0.2
 args = { finish_with_tool = true, open_max_workers = 128, cache_dir = "/tmp/i3_deepdive_cache_train" }
 
 [[orchestrator.env]]
 id = "math-env"
 name = "math"
+ratio = 0.3
 args = { min_avg_reward = 0.0, max_avg_reward = 0.874}
 
 [[orchestrator.env]]
 id = "logic-env"
-args = { min_avg_reward = 0.0, max_avg_reward = 0.874 }
 name = "logic"
+ratio = 0.2
+args = { min_avg_reward = 0.0, max_avg_reward = 0.874 }
 
 [[orchestrator.env]]
 id = "code-env"
 name = "code"
+ratio = 0.2
 args = { pool_size = 512 }
 
 [orchestrator.buffer]
-env_ratios = [0.3, 0.2, 0.3, 0.2, 0.2]
 easy_threshold = 1.0
 online_difficulty_filtering = true
 seed = 42

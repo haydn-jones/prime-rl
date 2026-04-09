@@ -10,7 +10,7 @@ import httpx
 import verifiers as vf
 from httpx import AsyncClient
 from openai import NotFoundError
-from tenacity import retry, retry_if_exception, stop_after_attempt, wait_exponential
+from tenacity import retry, retry_if_exception, stop_after_attempt, stop_after_delay, wait_exponential
 
 from prime_rl.configs.shared import ClientConfig
 from prime_rl.utils.logger import get_logger
@@ -295,7 +295,23 @@ def _is_retryable_lora_error(exception: BaseException) -> bool:
     if isinstance(exception, httpx.HTTPStatusError):
         # Retry on 404 (adapter not found) or 500 (server error during loading)
         return exception.response.status_code in (404, 500)
+    # Retry on transport-level failures (timeouts, connection resets, etc.) so
+    # the per-call read timeout below turns a stuck server into a bounded retry
+    # loop instead of propagating as a hard failure on the first hiccup.
+    if isinstance(exception, (httpx.TimeoutException, httpx.TransportError)):
+        return True
     return False
+
+
+# Per-attempt and total bounds for `/load_lora_adapter`. A LoRA load is fast
+# (small adapter file + KV cache reset, single-digit seconds in practice) but
+# the global admin AsyncClient uses `timeout=None`, so a stuck server hangs
+# the orchestrator forever inside `ElasticInferencePool._sync_server_adapter`.
+# `_PER_ATTEMPT` converts a hang into a TimeoutException so tenacity retries;
+# `_TOTAL` is the wall-clock budget across all retries — pick whichever
+# stop condition fires first.
+LORA_LOAD_READ_TIMEOUT_S = 30.0
+LORA_LOAD_TOTAL_TIMEOUT_S = 120.0
 
 
 async def load_lora_adapter(admin_clients: list[AsyncClient], lora_name: str, lora_path: Path) -> None:
@@ -312,8 +328,8 @@ async def load_lora_adapter(admin_clients: list[AsyncClient], lora_name: str, lo
 
     @retry(
         retry=retry_if_exception(_is_retryable_lora_error),
-        stop=stop_after_attempt(10),
-        wait=wait_exponential(multiplier=1, min=1, max=30),
+        stop=stop_after_delay(LORA_LOAD_TOTAL_TIMEOUT_S) | stop_after_attempt(10),
+        wait=wait_exponential(multiplier=1, min=1, max=10),
         reraise=True,
     )
     async def _load_lora_adapter(admin_client: AsyncClient) -> None:
@@ -321,6 +337,7 @@ async def load_lora_adapter(admin_clients: list[AsyncClient], lora_name: str, lo
         response = await admin_client.post(
             "/load_lora_adapter",
             json={"lora_name": lora_name, "lora_path": lora_path_posix},
+            timeout=httpx.Timeout(connect=10.0, read=LORA_LOAD_READ_TIMEOUT_S, write=60.0, pool=10.0),
         )
         response.raise_for_status()
 
@@ -378,7 +395,6 @@ async def init_nccl_broadcast(
                     "port": port,
                     "rank_offset": rank_offset,
                     "inference_world_size": inference_world_size,
-                    "gpus_per_server": gpus_per_server,
                     "timeout": timeout,
                     "quantize_in_weight_transfer": quantize_in_weight_transfer,
                 },

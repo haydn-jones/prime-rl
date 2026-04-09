@@ -35,6 +35,7 @@ dependencies = [
     "dion",
     "tilelang>=0.1.8",
     "flash-linear-attention",
+    "nvidia-ml-py>=12.575.51",
 ]
 
 [project.scripts]
@@ -52,9 +53,8 @@ prime_rl = "prime_rl.inference.patches:transformers_v5_compat"
 flash-attn = [
     "flash-attn @ https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/download/v0.7.16/flash_attn-2.8.3+cu128torch2.10-cp312-cp312-linux_x86_64.whl ; platform_machine == 'x86_64'",
 ]
-flash-attn-3 = [
-    "flash_attn_3 @ https://github.com/samsja/flash-attn-builds/releases/download/v0.1/flash_attn_3-3.0.0b1-cp39-abi3-linux_x86_64.whl ; platform_machine == 'x86_64'",
-]
+flash-attn-3 = ["flash_attn_3"]
+
 flash-attn-cute = [
     "flash-attn-4",
 ]
@@ -126,7 +126,7 @@ dion = { git = "https://github.com/samsja/dion.git", rev = "d891eeb" }
 transformers = { git = "https://github.com/huggingface/transformers.git", rev = "c1c3424" }
 flash-attn-4 = { git = "https://github.com/Dao-AILab/flash-attention.git", subdirectory = "flash_attn/cute", rev = "abd9943b" }
 pydantic-config = { git = "https://github.com/samsja/pydantic_config.git", branch = "main" }
-vllm-router = { url = "https://github.com/PrimeIntellect-ai/router/releases/download/v0.1.14/vllm_router-0.1.14-cp38-abi3-linux_x86_64.whl" }
+vllm-router = { url = "https://github.com/PrimeIntellect-ai/router/releases/download/v0.1.18/vllm_router-0.1.16-cp38-abi3-manylinux_2_28_x86_64.whl" }
 reverse-text = { index = "primeintellect" }
 alphabet-sort = { index = "primeintellect" }
 wiki-search = { index = "primeintellect" }
@@ -141,10 +141,11 @@ aime2024 = { index = "primeintellect" }
 aime2025 = { index = "primeintellect" }
 deepdive = { index = "primeintellect" }
 mini_swe_agent_plus = { index = "primeintellect" }
-deep-ep = { url = "https://github.com/samsja/flash-attn-builds/releases/download/v0.2/deep_ep-1.2.1+73b6ea4-cp312-cp312-linux_x86_64.whl" }
-deep-gemm = { url = "https://github.com/samsja/flash-attn-builds/releases/download/v0.2/deep_gemm-2.3.0+477618c-cp312-cp312-linux_x86_64.whl" }
-nixl-cu12 = { url = "https://github.com/samsja/flash-attn-builds/releases/download/v0.2/nixl_cu12-0.10.1-cp312-cp312-linux_x86_64.whl" }
+deep-ep = { url = "https://github.com/samsja/research-pre-built-wheels/releases/download/v0.2/deep_ep-1.2.1+73b6ea4-cp312-cp312-linux_x86_64.whl" }
+deep-gemm = { url = "https://github.com/samsja/research-pre-built-wheels/releases/download/v0.2/deep_gemm-2.3.0+477618c-cp312-cp312-linux_x86_64.whl" }
+nixl-cu12 = { url = "https://github.com/samsja/research-pre-built-wheels/releases/download/v0.2/nixl_cu12-0.10.1-cp312-cp312-linux_x86_64.whl" }
 flash-linear-attention = { git = "https://github.com/fla-org/flash-linear-attention" }
+flash_attn_3 = { index = "pytorch-cu128-test" }
 
 [tool.uv.extra-build-dependencies]
 flash-attn = [{ requirement = "torch", match-runtime = true }]
@@ -164,6 +165,11 @@ name = "pytorch-cu128"
 url = "https://download.pytorch.org/whl/cu128"
 explicit = true
 
+
+[[tool.uv.index]]
+name = "pytorch-cu128-test"
+url = "https://download.pytorch.org/whl/test/cu128"
+explicit = true
 
 [tool.ruff.lint]
 select = ["F", "I"]

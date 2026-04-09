@@ -1,7 +1,5 @@
 import asyncio
-import atexit
 import gc
-import multiprocessing as mp
 import os
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -9,7 +7,7 @@ from concurrent.futures import ThreadPoolExecutor
 import tomli_w
 
 from prime_rl.orchestrator.advantage import compute_advantages
-from prime_rl.orchestrator.eval_utils import compute_eval_ckpt_step, get_eval_sampling_args
+from prime_rl.orchestrator.eval_utils import compute_eval_ckpt_step
 from prime_rl.orchestrator.event_loop_lag import EventLoopLagMonitor
 from prime_rl.orchestrator.patches import monkey_patch_chat_completion_logprobs, monkey_patch_oai_iterable_types
 from prime_rl.orchestrator.trajectories import (
@@ -20,6 +18,7 @@ from prime_rl.orchestrator.trajectories import (
 )
 from prime_rl.transport import TrainingBatch, TrainingSample, setup_training_batch_sender
 from prime_rl.utils.pathing import get_log_dir
+from prime_rl.utils.usage_reporter import UsageReporter
 
 # This monkey patch is necessary to avoid Pydantic validating fields using typing.Iterable (e.g. in multimodal or tool call messages) lazily which leads to tokenization errors, for more info see https://github.com/PrimeIntellect-ai/prime-rl/pull/1249
 monkey_patch_oai_iterable_types()
@@ -34,30 +33,22 @@ import pandas as pd
 import verifiers as vf
 from transformers import AutoProcessor, AutoTokenizer
 
-from prime_rl.configs.orchestrator import BufferConfig, OrchestratorConfig
+from prime_rl.configs.orchestrator import OrchestratorConfig
 from prime_rl.orchestrator.buffer import Buffer
 from prime_rl.orchestrator.ckpt import Progress, setup_ckpt_manager
-from prime_rl.orchestrator.eval_utils import evaluate_env
+from prime_rl.orchestrator.envs import EvalEnvs, TrainEnvs
 from prime_rl.orchestrator.filters import apply_filters, setup_filters
 from prime_rl.orchestrator.scheduler import Scheduler
 from prime_rl.orchestrator.utils import (
     compute_teacher_logprobs,
-    get_sampling_args,
     get_weight_dir,
     print_benchmark,
-    set_semaphore,
     setup_external_rollout_model,
 )
 from prime_rl.orchestrator.vf_utils import (
-    generate,
     get_completion_len,
     get_seq_len,
     intercept_vf_logging,
-    resolve_num_workers,
-    setup_env_client,
-    spawn_env_server,
-    task_uses_group_scoring,
-    wait_for_env_servers,
 )
 from prime_rl.utils.client import (
     init_nccl_broadcast,
@@ -68,13 +59,11 @@ from prime_rl.utils.heartbeat import Heartbeat
 from prime_rl.utils.logger import setup_logger
 from prime_rl.utils.monitor import setup_monitor
 from prime_rl.utils.process import set_proc_title
-from prime_rl.utils.temp_scheduling import compute_temperature
 from prime_rl.utils.utils import (
     clean_exit,
     get_env_ids_to_install,
     install_env,
     resolve_latest_ckpt_step,
-    strip_env_version,
     to_col_format,
 )
 
@@ -93,7 +82,7 @@ async def orchestrate(config: OrchestratorConfig):
         config.log.level,
         json_logging=config.log.json_logging,
     )
-    intercept_vf_logging(logger="verifiers.serve", level=config.log.vf_level)  # show logs from env clients
+    intercept_vf_logging(logger="verifiers.serve", level="WARN")  # show logs from env clients
     logger.info("Starting orchestrator")
 
     event_loop_lag_monitor = EventLoopLagMonitor()
@@ -111,7 +100,7 @@ async def orchestrate(config: OrchestratorConfig):
 
     # Install environments
     env_ids_to_install = set()
-    env_ids_to_install.update(get_env_ids_to_install(config.env))
+    env_ids_to_install.update(get_env_ids_to_install(config.train.env))
     if config.eval is not None:
         env_ids_to_install.update(get_env_ids_to_install(config.eval.env))
 
@@ -157,7 +146,7 @@ async def orchestrate(config: OrchestratorConfig):
             config.model.name, trust_remote_code=config.model.trust_remote_code, use_fast=True
         )
 
-    # Setup monitor
+    # Setup monitor (may register the run and set RUN_ID in the environment)
     logger.info(f"Initializing monitor (wandb={config.wandb}, prime_monitor={config.prime_monitor})")
     monitor = setup_monitor(
         wandb_config=config.wandb,
@@ -166,6 +155,22 @@ async def orchestrate(config: OrchestratorConfig):
         tokenizer=tokenizer,
         run_config=config,
     )
+
+    # Read run_id AFTER setup_monitor so that newly registered runs are captured
+    run_id = os.getenv("RUN_ID", "")
+
+    # Usage reporter requires BOTH the base URL and the API key. Activating
+    # with only one set used to crash every POST inside httpx (None header
+    # value), so we now gate construction on both being present and log a
+    # clear warning when half-configured.
+    usage_base_url = os.environ.get("PI_USAGE_BASE_URL")
+    usage_api_key = os.environ.get("PI_USAGE_API_KEY")
+    if usage_base_url and usage_api_key:
+        usage_reporter = UsageReporter()
+    else:
+        if usage_base_url and not usage_api_key:
+            logger.warning("PI_USAGE_BASE_URL is set but PI_USAGE_API_KEY is missing; usage reporting disabled.")
+        usage_reporter = None
 
     # Setup heartbeat (only on rank 0, orchestrator is single process)
     heart = None
@@ -178,156 +183,34 @@ async def orchestrate(config: OrchestratorConfig):
     if rollout_filters:
         logger.info(f"Initialized {len(rollout_filters)} rollout filter(s): {[f.name for f in rollout_filters]}")
 
-    # Load environment and extract dataset
-    logger.info(
-        f"Loading {len(config.env)} training environment(s) ({', '.join(env.resolved_name for env in config.env)})"
+    # Load environments
+    logger.info("Loading training environments")
+    train_envs = TrainEnvs(config.train.env)
+    logger.info(f"Loaded {len(train_envs)} training environment(s) ({', '.join(train_envs.names)})")
+
+    await train_envs.start(
+        log_dir=get_log_dir(config.output_dir.parent) / "envs" / "train",
+        log_level=config.log.vf_level,
+        json_logging=config.log.json_logging,
     )
-    env_ids = [strip_env_version(env.id) for env in config.env]
-    train_env_names = [env.resolved_name for env in config.env]
-    train_env_group = vf.EnvGroup(
-        envs=[vf.load_environment(env_id, **env.args) for env_id, env in zip(env_ids, config.env)],
-        env_names=train_env_names,
-        map_kwargs=dict(writer_batch_size=1),  # set defensively to not error on map operations on large datasets
-    )
-    verification_enabled = config.verification.enabled
+    logger.success("Train environment(s) ready")
 
-    train_env_deferred_group_scoring_tasks = (
-        {env_name for env_name in train_env_names if task_uses_group_scoring(train_env_group, env_name)}
-        if verification_enabled
-        else set()
-    )
-    for train_env_name, env_cfg in zip(train_env_names, config.env):
-        env_cfg.extra_env_kwargs["score_rollouts"] = (
-            verification_enabled and train_env_name not in train_env_deferred_group_scoring_tasks
-        )
-    if not verification_enabled:
-        logger.info("Verification disabled; all training envs will skip scoring.")
-    elif train_env_deferred_group_scoring_tasks:
-        deferred_tasks = ", ".join(sorted(train_env_deferred_group_scoring_tasks))
-        logger.info(
-            f"Deferred group scoring enabled for training tasks: {deferred_tasks}. "
-            "Rollouts run individually and are scored once each group completes."
-        )
-
-    train_env_addresses = []
-    env_processes: list[mp.Process] = []
-
-    def _cleanup_env_processes():
-        if not env_processes:
-            return
-        logger.info(f"Shutting down {len(env_processes)} env server(s), waiting for sandbox cleanup...")
-        for proc in env_processes:
-            proc.terminate()
-        for proc in env_processes:
-            proc.join(timeout=25)
-            if proc.is_alive():
-                logger.warning(f"Env server {proc.pid} did not exit after 25s, force killing")
-                proc.kill()
-                proc.join(timeout=5)
-
-    atexit.register(_cleanup_env_processes)
-
-    for env_id, env, env_name in zip(env_ids, config.env, train_env_names):
-        if env.address is None:
-            num_workers = resolve_num_workers(env.num_workers, config.max_inflight_rollouts)
-            log_dir = (get_log_dir(config.output_dir.parent) / "envs" / "train" / env_name).as_posix()
-            address, process = spawn_env_server(
-                env_id=env_id,
-                env_args=env.args,
-                extra_env_kwargs=env.extra_env_kwargs,
-                num_workers=num_workers,
-                log_level=config.log.vf_level,
-                log_dir=log_dir,
-                json_logging=config.log.json_logging,
-            )
-            logger.info(f"Spawned env server for {env_name} with {num_workers} worker(s)")
-            env_processes.append(process)
-        else:
-            if env_name in train_env_deferred_group_scoring_tasks:
-                logger.warning(
-                    f"Training env {env_name} uses external server at {env.address}. "
-                    "Ensure that server was started with score_rollouts=False."
-                )
-            address = env.address
-        logger.info(f"Connecting train environment {env_name} to server at {address}")
-        train_env_addresses.append(address)
-    train_env_clients = [
-        setup_env_client(address=address, name=name) for name, address in zip(train_env_names, train_env_addresses)
-    ]
-
-    logger.info("Waiting for train environment servers to be ready")
-    await wait_for_env_servers(train_env_clients)
-    logger.success("Train environment servers ready")
-
-    # this puts all train envs into server model
-    # all calls to run_rollout and run_group will be routed to the server via the env client
-    for env, env_client in zip(train_env_group.envs, train_env_clients):
-        env.env_client = env_client
-
+    eval_envs: EvalEnvs | None = None
     if config.eval:
-        env_ids = [strip_env_version(env.id) for env in config.eval.env]
-        eval_envs = [vf.load_environment(env_id, **env.args) for env_id, env in zip(env_ids, config.eval.env)]
-        eval_env_names = [env.resolved_name for env in config.eval.env]
-        eval_sampling_args = get_eval_sampling_args(config.eval.sampling)
-        eval_env_addresses = []
+        logger.info("Loading eval environment(s)")
+        eval_envs = EvalEnvs(config.eval.env)
+        logger.info(f"Loaded {len(eval_envs)} eval environment(s) ({', '.join(eval_envs.names)})")
 
-        for env_id, env, eval_env_name in zip(env_ids, config.eval.env, eval_env_names):
-            if env.address is None:
-                num_examples = env.num_examples or config.eval.num_examples
-                rollouts_per_example = env.rollouts_per_example or config.eval.rollouts_per_example
-                if num_examples == -1:
-                    max_concurrent = 1024
-                    logger.warning(
-                        f"Eval env '{eval_env_name}' uses all examples (num_examples=-1). "
-                        f"Defaulting max_concurrent={max_concurrent} for worker scaling."
-                    )
-                else:
-                    max_concurrent = num_examples * rollouts_per_example
-                num_workers = resolve_num_workers(env.num_workers, max_concurrent)
-                log_dir = (get_log_dir(config.output_dir.parent) / "envs" / "eval" / eval_env_name).as_posix()
-                address, process = spawn_env_server(
-                    env_id=env_id,
-                    env_args=env.args,
-                    extra_env_kwargs=env.extra_env_kwargs,
-                    num_workers=num_workers,
-                    log_level=config.log.vf_level,
-                    log_dir=log_dir,
-                    json_logging=config.log.json_logging,
-                )
-                logger.info(f"Spawned eval env server for {eval_env_name} with {num_workers} worker(s)")
-                env_processes.append(process)
-            else:
-                address = env.address
-            logger.info(f"Connecting eval environment {eval_env_name} to server at {address}")
-            eval_env_addresses.append(address)
-
-        eval_env_clients = [
-            setup_env_client(address=address, name=name) for name, address in zip(eval_env_names, eval_env_addresses)
-        ]
-
-        logger.info("Waiting for eval environment servers to be ready")
-        await wait_for_env_servers(eval_env_clients)
-        logger.success("Eval environment servers ready")
-
-        # this puts all eval envs into server mode
-        # all calls to run_rollout and run_group will be routed to the server via the env client
-        for eval_env, eval_env_client in zip(eval_envs, eval_env_clients):
-            eval_env.env_client = eval_env_client
-    else:
-        eval_envs: list[vf.Environment] = []
-        eval_env_names: list[str] = []
-        eval_sampling_args = {}
+        await eval_envs.start(
+            log_dir=get_log_dir(config.output_dir.parent) / "envs" / "eval",
+            log_level=config.log.vf_level,
+            json_logging=config.log.json_logging,
+        )
+        logger.success("Eval environment(s) ready")
 
     # Setup buffer
     logger.info(f"Setting up buffer ({config.buffer})")
-    train_dataset = train_env_group.get_dataset(seed=config.buffer.seed)
-    buffer = Buffer(train_dataset, train_env_group.env_names, config.buffer)
-    if config.val is not None:
-        val_buffer_config = BufferConfig(env_ratios=config.buffer.env_ratios)
-        val_dataset = train_env_group.get_eval_dataset(seed=val_buffer_config.seed)
-        val_buffer = Buffer(val_dataset, train_env_group.env_names, val_buffer_config)
-    else:
-        val_buffer = None
+    buffer = Buffer(train_envs, config.buffer)
 
     # Get checkpoint manager
     logger.info(f"Initializing checkpoint manager ({config.ckpt})")
@@ -341,7 +224,7 @@ async def orchestrate(config: OrchestratorConfig):
             checkpoint_step = config.ckpt.resume_step
 
     scheduler = Scheduler(
-        env=train_env_group,
+        train_envs=train_envs,
         buffer=buffer,
         inference_pool=inference_pool,
         max_inflight_rollouts=config.max_inflight_rollouts,
@@ -351,7 +234,6 @@ async def orchestrate(config: OrchestratorConfig):
         tasks_per_minute=config.tasks_per_minute,
         enable_policy_updates=enable_policy_updates,
         lora_name=config.model.lora.name if config.model.lora else None,
-        deferred_group_scoring_tasks=train_env_deferred_group_scoring_tasks,
         config=config,
     )
     scheduler.model_name = rollout_model_name
@@ -424,10 +306,8 @@ async def orchestrate(config: OrchestratorConfig):
         logger.info("Training from scratch")
 
     # Iterate over dataset in batches
-    max_steps = config.max_steps or int(1e9)
-    logger.info(f"Starting orchestrator loop (max_steps={max_steps or 'infinite'})")
+    logger.info(f"Starting orchestrator loop (max_steps={config.max_steps or 'infinite'})")
     is_first_step = True
-    await set_semaphore(config.max_concurrent or -1)
 
     # Persistent ThreadPoolExecutor for parallel rollout processing
     rollout_executor = ThreadPoolExecutor(max_workers=64)
@@ -469,6 +349,7 @@ async def orchestrate(config: OrchestratorConfig):
         # Use range check to handle ckpt_step jumping over interval boundaries.
         eval_ckpt_step = None
         if config.eval:
+            assert eval_envs is not None
             eval_ckpt_step = compute_eval_ckpt_step(
                 ckpt_step=ckpt_step,
                 prev_ckpt_step=prev_ckpt_step,
@@ -493,21 +374,15 @@ async def orchestrate(config: OrchestratorConfig):
                 logger.info("Cancelling in-flight training rollouts before starting evals to avoid congestion.")
                 await scheduler.cancel_inflight_rollouts()
 
-            results = await asyncio.gather(
+            await asyncio.gather(
                 *[
-                    evaluate_env(
-                        env=eval_env,
-                        env_name=eval_env_name,
-                        get_client=inference_pool.get_next_client,
+                    eval_env.evaluate(
                         model_name=scheduler.model_name,
-                        sampling_args=eval_sampling_args,
-                        num_examples=eval_env_config.num_examples or config.eval.num_examples,
-                        rollouts_per_example=eval_env_config.rollouts_per_example or config.eval.rollouts_per_example,
-                        max_retries=eval_env_config.max_retries,
+                        get_client=inference_pool.get_next_client,
                         ckpt_step=ckpt_step,
                         step=progress.step,
                     )
-                    for eval_env, eval_env_name, eval_env_config in zip(eval_envs, eval_env_names, config.eval.env)
+                    for eval_env in eval_envs
                 ]
             )
 
@@ -518,29 +393,7 @@ async def orchestrate(config: OrchestratorConfig):
         prev_ckpt_step = ckpt_step
 
         # Schedule generating the training batch
-        temperature = compute_temperature(progress.step, config.sampling, config.max_steps)
-        is_vllm = config.teacher_rollout_model is None
-        sampling_args = get_sampling_args(config.sampling, temperature=temperature, is_vllm=is_vllm)
-        scheduler.set_sampling_args(sampling_args)
         train_task = asyncio.create_task(scheduler.generate_batch(step=progress.step))
-
-        # Schedule running validation at the specified interval
-        if val_buffer and config.val and progress.step % config.val.interval == 0:
-            logger.info(f"Running validation for step {progress.step}")
-            val_examples = val_buffer.sample_examples(config.val.num_examples)
-            val_task = asyncio.create_task(
-                generate(
-                    env=train_env_group,
-                    model_name=scheduler.model_name,
-                    examples=val_examples,
-                    rollouts_per_example=config.val.rollouts_per_example,
-                    sampling_args=sampling_args,
-                    clients=inference_pool.clients,
-                    pbar_description="Generating rollouts (val)",
-                )
-            )
-        else:
-            val_task = asyncio.create_task(asyncio.sleep(0))  # Dummy task
 
         # Await train rollouts
         await train_task
@@ -659,17 +512,13 @@ async def orchestrate(config: OrchestratorConfig):
 
         training_batch_sender.send(training_batch)
 
-        # Await and process val results
-        await val_task
-        val_outputs = val_task.result()
-
         step_time = time.perf_counter() - step_start_time
 
         # Gather metrics in dataframes
         results_df = pd.DataFrame(
             {
                 "example_id": [rollout["example_id"] for rollout in train_rollouts],
-                "task": [rollout["task"] for rollout in train_rollouts],
+                "env_name": [rollout["env_name"] for rollout in train_rollouts],
                 "reward": [rollout["reward"] for rollout in train_rollouts],
                 "is_truncated": [rollout["is_truncated"] for rollout in train_rollouts],
                 "stop_condition": [rollout.get("stop_condition") for rollout in train_rollouts],
@@ -685,18 +534,6 @@ async def orchestrate(config: OrchestratorConfig):
 
         # Separate DataFrame for env reward function metrics to avoid column name collisions
         metrics_df = pd.DataFrame([rollout["metrics"] for rollout in train_rollouts])
-
-        val_results_df = (
-            pd.DataFrame(
-                {
-                    "example_id": [rollout["example_id"] for rollout in val_outputs],
-                    "task": [rollout["task"] for rollout in val_outputs],
-                    "reward": [rollout["reward"] for rollout in val_outputs],
-                }
-            )
-            if val_outputs is not None
-            else None
-        )
 
         # Update progress metrics
         num_tokens = int(results_df.seq_len.sum())
@@ -761,12 +598,11 @@ async def orchestrate(config: OrchestratorConfig):
             "reward/all/mean": by_example.reward.mean().mean(),
             "reward/all/max": by_example.reward.mean().max(),
             "reward/all/min": by_example.reward.mean().min(),
-            "sampling/temperature": temperature,
             # Solve / batch metrics
             "solve_none/all": solve_none,
             "solve_all/all": solve_all,
             "effective_batch_size/all": effective_batch_size,
-            **{f"batch/{env}": r for env, r in results_df.task.value_counts(normalize=True).items()},
+            **{f"batch/{env}": r for env, r in results_df.env_name.value_counts(normalize=True).items()},
             # Time metrics
             "time/step": step_time,
             "time/generate_completions": generate_completions_time,
@@ -797,7 +633,7 @@ async def orchestrate(config: OrchestratorConfig):
             "scoring_ms",
         ]
 
-        for env, env_df in results_df.groupby("task"):
+        for env, env_df in results_df.groupby("env_name"):
             env_by_example = env_df.groupby("example_id")
             for col in per_env_columns:
                 to_log[f"{col}/{env}/mean"] = env_by_example[col].mean().mean()
@@ -820,18 +656,6 @@ async def orchestrate(config: OrchestratorConfig):
             for metric in metrics_df.columns:
                 to_log[f"metrics/{env}/{metric}"] = env_metrics_df.groupby(env_df["example_id"])[metric].mean().mean()
 
-        # Optionally, add val metrics
-        if val_results_df is not None:
-            val_by_example = val_results_df.groupby("example_id")
-            to_log["val/reward/all/mean"] = val_by_example.reward.mean().mean()
-            to_log["val/reward/all/max"] = val_by_example.reward.mean().max()
-            to_log["val/reward/all/min"] = val_by_example.reward.mean().min()
-            for env, env_df in val_results_df.groupby("task"):
-                env_by_example = env_df.groupby("example_id")
-                to_log[f"val/reward/{env}/mean"] = env_by_example.reward.mean().mean()
-                to_log[f"val/reward/{env}/max"] = env_by_example.reward.mean().max()
-                to_log[f"val/reward/{env}/min"] = env_by_example.reward.mean().min()
-
         # Log metrics to monitor(s)
         monitor.log(to_log, step=progress.step)
 
@@ -847,12 +671,15 @@ async def orchestrate(config: OrchestratorConfig):
             step=progress.step,
         )
 
+        if usage_reporter and run_id:
+            usage_reporter.report_training_usage(
+                run_id=run_id,
+                step=progress.step,
+                tokens=num_prefill_tokens + num_decode_tokens,
+            )
+
         reward_mean = by_example.reward.mean().mean()
-        val_reward_str = ""
-        if val_results_df is not None:
-            val_reward_mean = val_results_df.groupby("example_id").reward.mean().mean()
-            val_reward_str = f" Val. Reward: {val_reward_mean:.4f} |"
-        step_message = f"Step {progress.step} | Time: {step_time:.2f}s | Reward: {reward_mean:.4f} |{val_reward_str} Seq. Length: {by_example.seq_len.mean().mean():.1f} tokens/sample | Async Level: {scheduler.async_level} | Max. Off-Policy Level: {scheduler.max_off_policy_level}"
+        step_message = f"Step {progress.step} | Time: {step_time:.2f}s | Reward: {reward_mean:.4f} | Seq. Length: {by_example.seq_len.mean().mean():.1f} tokens/sample | Async Level: {scheduler.async_level} | Max. Off-Policy Level: {scheduler.max_off_policy_level}"
         logger.success(step_message)
 
         # Increment step
@@ -861,7 +688,7 @@ async def orchestrate(config: OrchestratorConfig):
 
         # Free large per-step objects to prevent memory accumulation
         del train_rollouts, train_examples, training_batch, vlm_cache
-        del results_df, metrics_df, val_results_df
+        del results_df, metrics_df
         gc.collect()
 
         event_loop_lag_monitor.reset()
@@ -870,23 +697,17 @@ async def orchestrate(config: OrchestratorConfig):
         if heart is not None:
             heart.beat()
 
-    if config.eval:
+    if config.eval and eval_envs is not None:
         logger.info("Running final evals")
-        results = await asyncio.gather(
+        await asyncio.gather(
             *[
-                evaluate_env(
-                    env=eval_env,
-                    env_name=eval_env_name,
-                    get_client=inference_pool.get_next_client,
+                eval_env.evaluate(
                     model_name=scheduler.model_name,
-                    sampling_args=eval_sampling_args,
-                    num_examples=eval_env_config.num_examples or config.eval.num_examples,
-                    rollouts_per_example=eval_env_config.rollouts_per_example or config.eval.rollouts_per_example,
-                    max_retries=eval_env_config.max_retries,
+                    get_client=inference_pool.get_next_client,
                     ckpt_step=ckpt_step,
                     step=progress.step,
                 )
-                for eval_env, eval_env_name, eval_env_config in zip(eval_envs, eval_env_names, config.eval.env)
+                for eval_env in eval_envs
             ]
         )
 
@@ -914,8 +735,10 @@ async def orchestrate(config: OrchestratorConfig):
         if teacher_inference_pool is not None:
             await teacher_inference_pool.stop()
         event_loop_lag_monitor_task.cancel()
-        atexit.unregister(_cleanup_env_processes)
-        _cleanup_env_processes()
+        # Shutdown env processes (also registered as atexit handler for crash safety)
+        train_envs.shutdown()
+        if eval_envs is not None:
+            eval_envs.shutdown()
 
     shutdown_task = asyncio.create_task(_graceful_shutdown())
     _, pending = await asyncio.wait({shutdown_task}, timeout=SHUTDOWN_TIMEOUT_S)
@@ -931,6 +754,9 @@ async def orchestrate(config: OrchestratorConfig):
     # failure surfaces the same way as it did when each step was awaited
     # directly.
     await shutdown_task
+
+    if usage_reporter:
+        usage_reporter.close()
 
     logger.success("Orchestrator finished.")
 

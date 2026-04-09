@@ -809,3 +809,31 @@ def monkey_patch_dp_engine_core_pause_resume_deadlock():
     DPEngineCoreProc._handle_client_request = _patched_handle_client_request
     DPEngineCoreProc.resume_scheduler = _patched_resume_scheduler
     DPEngineCoreProc._has_global_unfinished_reqs = _patched_has_global_unfinished_reqs
+
+
+def monkey_patch_no_moe_lora():
+    """This disables LoRA for MoE layers and makes them pick better kernels.
+
+    Otherwise, the oracle will always try to pick TritonExperts.
+    For blackwells, we want TRTLLMFlashInfer.
+    """
+    from vllm.model_executor.layers.fused_moe.config import FusedMoEConfig, logger
+
+    def _patched__post_init__(self: FusedMoEConfig):
+        if self.dp_size > 1:
+            logger.debug_once("Using FusedMoEConfig::max_num_tokens=%d", self.max_num_tokens)
+
+        assert self.max_num_tokens > 0
+
+        if self.router_logits_dtype is None:
+            self.router_logits_dtype = self.in_dtype
+
+        if self.hidden_dim_unpadded is None:
+            self.hidden_dim_unpadded = self.hidden_dim
+        if self.intermediate_size_per_partition_unpadded is None:
+            self.intermediate_size_per_partition_unpadded = self.intermediate_size_per_partition
+
+        # Disable LoRA for MoE layers
+        self.is_lora_enabled = False
+
+    FusedMoEConfig.__post_init__ = _patched__post_init__
