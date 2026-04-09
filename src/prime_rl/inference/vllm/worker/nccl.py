@@ -14,6 +14,7 @@ from prime_rl.inference.vllm.worker.weight_transfer import (
     postprocess_weights_checkpoint,
     postprocess_weights_kernel,
 )
+from prime_rl.utils.nccl import disable_nccl_p2p_if_unavailable
 
 # This is to get type hints for the Worker class but not actually extend it at runtime as this is required by vLLM worker extension
 if TYPE_CHECKING:
@@ -73,6 +74,7 @@ class NCCLWeightBroadcastReceiver:
         timeout: int,
     ):
         logger.info(f"Initializing NCCL broadcast receiver ({host}:{port}, rank={rank}, world_size={world_size})")
+        disable_nccl_p2p_if_unavailable()
 
         pg = StatelessProcessGroup.create(host=host, port=port, rank=rank, world_size=world_size, store_timeout=timeout)
         self.communicator = PyNcclCommunicator(pg, device=device)

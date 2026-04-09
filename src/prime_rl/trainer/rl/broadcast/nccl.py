@@ -17,6 +17,7 @@ from prime_rl.trainer.runs import get_multi_run_manager
 from prime_rl.trainer.utils import get_world
 from prime_rl.trainer.weights import get_max_layer_num
 from prime_rl.utils.logger import get_logger
+from prime_rl.utils.nccl import disable_nccl_p2p_if_unavailable
 from prime_rl.utils.pathing import sync_wait_for_path
 from prime_rl.utils.utils import get_broadcast_dir, get_step_path
 from prime_rl.utils.vlm import get_layer_prefix
@@ -126,6 +127,7 @@ class NCCLWeightBroadcastSender:
         self.quantize_in_weight_transfer = quantize_in_weight_transfer
 
         if self.world.is_master:
+            disable_nccl_p2p_if_unavailable()
             # Trainer is on rank 0 in process group with all inference GPUs
             pg = StatelessProcessGroup.create(
                 host=host, port=port, rank=rank, world_size=world_size, store_timeout=timeout
