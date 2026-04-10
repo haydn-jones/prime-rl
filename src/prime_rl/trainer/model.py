@@ -1,7 +1,13 @@
 import logging
+import os
 import time
 from pathlib import Path
 from typing import cast
+
+# Disable transformers hub kernel interception by default. The `kernels` package, when installed,
+# causes transformers to auto-replace modules (e.g. mamba-ssm) with hub kernel versions that may
+# have incompatible CUDA requirements. We only enable it explicitly for models that need it (GPT-OSS).
+os.environ.setdefault("USE_HUB_KERNELS", "NO")
 
 import torch
 import torch._dynamo
@@ -235,6 +241,23 @@ def get_model(
                 "VLM models must use optimization_dtype='bfloat16' and reduce_dtype='bfloat16' to match vLLM inference."
             )
 
+    # GPT-OSS only supports FlashAttention via kernels-community/vllm-flash-attn3, which requires Hopper (SM 90).
+    # On other architectures (e.g. Blackwell), users must fall back to eager attention.
+    HOPPER_MAJOR = 9
+    if getattr(model_config, "model_type", "") == "gpt_oss":
+        if config.attn != "eager":
+            major, minor = torch.cuda.get_device_capability()
+            if major != HOPPER_MAJOR:
+                raise ValueError(
+                    f"GPT-OSS requires 'attn = \"eager\"' on non-Hopper GPUs (detected SM {major}{minor}). "
+                    f"The only flash attention kernel supported by GPT-OSS (kernels-community/vllm-flash-attn3) is Hopper-only. "
+                    f'Set [trainer.model] attn = "eager" in your config.'
+                )
+        # Enable hub kernels for GPT-OSS (disabled by default to avoid interfering with other models).
+        import transformers.integrations.hub_kernels as _hub_kernels
+
+        _hub_kernels._kernels_enabled = True
+
     # Fallback Qwen3.5 patch detection from loaded config model_type
     if getattr(model_config, "model_type", "").startswith("qwen3_5_moe"):
         _patch_qwen3_5_text_position_ids()
@@ -258,10 +281,15 @@ def get_model(
             ),
             None,
         )
+        # Some HF configs (e.g. Llama 3.2) set pad_token_id to a list, which
+        # crashes both huggingface_hub's strict setter and transformers'
+        # GenerationConfig.validate(). Unwrap before assigning.
+        if isinstance(pad_token_id, list):
+            pad_token_id = pad_token_id[0]
         model_config.pad_token_id = pad_token_id
 
-    # Some HF configs (e.g. Llama 3.2) set pad_token_id to a list, which crashes
-    # transformers' GenerationConfig.validate() when it does `pad_token_id < 0`.
+    # Handle list pad_token_id that was already set on the config (not from our
+    # fallback above, but directly in the model's config.json).
     if isinstance(getattr(model_config, "pad_token_id", None), list):
         model_config.pad_token_id = model_config.pad_token_id[0]
 
