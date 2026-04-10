@@ -9,6 +9,7 @@ from torch import Tensor, nn
 from torch.nn.attention.flex_attention import BlockMask, FlexKernelOptions, create_block_mask, flex_attention
 from torch.nn.attention.varlen import varlen_attn
 from transformers.activations import ACT2FN
+from transformers.generation import GenerationMixin
 from transformers.modeling_layers import GradientCheckpointingLayer
 from transformers.modeling_outputs import BaseModelOutputWithPast
 from transformers.models.gemma4.configuration_gemma4 import Gemma4Config, Gemma4TextConfig
@@ -598,7 +599,7 @@ class Gemma4PreTrainedModel(PreTrainedModelPrimeRL):
         return run_on_flat_language_model_keys(state_dict)
 
 
-class Gemma4ForCausalLM(Gemma4PreTrainedModel):
+class Gemma4ForCausalLM(Gemma4PreTrainedModel, GenerationMixin):
     _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
 
     def __init__(self, config: Gemma4TextConfig | Gemma4Config, **kwargs: object) -> None:
