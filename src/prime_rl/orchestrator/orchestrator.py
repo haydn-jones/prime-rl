@@ -110,14 +110,12 @@ async def orchestrate(config: OrchestratorConfig):
     # Setup rollout inference pool (handles both static and elastic modes)
     rollout_client_config, rollout_model_name, enable_policy_updates = setup_external_rollout_model(config, logger)
 
-    client_type = "openai_chat_completions_token" if config.use_token_client else "openai_chat_completions"
-    if config.use_token_client:
-        logger.warning(
-            "Token-in-token-out (TITO) client is enabled. Only use this if your environment has a linear "
-            "history and the chat template has the extension property."
-        )
+    train_client_type = "openai_chat_completions_token" if config.use_token_client else "openai_chat_completions"
     inference_pool = await setup_inference_pool(
-        rollout_client_config, model_name=rollout_model_name, client_type=client_type
+        rollout_client_config,
+        model_name=rollout_model_name,
+        train_client_type=train_client_type,
+        eval_client_type="openai_chat_completions",
     )
 
     # Setup teacher inference pool if configured
@@ -127,7 +125,9 @@ async def orchestrate(config: OrchestratorConfig):
             f"model={config.teacher_model.model.name})"
         )
         teacher_inference_pool = await setup_inference_pool(
-            config.teacher_model.client, model_name=config.teacher_model.model.name
+            config.teacher_model.client,
+            model_name=config.teacher_model.model.name,
+            train_client_type="openai_chat_completions",
         )
     else:
         teacher_inference_pool = None
@@ -379,7 +379,7 @@ async def orchestrate(config: OrchestratorConfig):
                 *[
                     eval_env.evaluate(
                         model_name=scheduler.model_name,
-                        get_client=inference_pool.get_next_client,
+                        get_client=inference_pool.get_eval_client,
                         ckpt_step=ckpt_step,
                         step=progress.step,
                     )
@@ -497,7 +497,7 @@ async def orchestrate(config: OrchestratorConfig):
             logger.info(f"Computing teacher logprobs for {len(train_examples)} training examples")
             teacher_logprobs_start_time = time.perf_counter()
             teacher_logprobs_list = await compute_teacher_logprobs(
-                clients=teacher_inference_pool.clients,
+                clients=teacher_inference_pool.train_clients,
                 model_name=config.teacher_model.model.name,
                 samples=train_examples,
             )
@@ -704,7 +704,7 @@ async def orchestrate(config: OrchestratorConfig):
             *[
                 eval_env.evaluate(
                     model_name=scheduler.model_name,
-                    get_client=inference_pool.get_next_client,
+                    get_client=inference_pool.get_eval_client,
                     ckpt_step=ckpt_step,
                     step=progress.step,
                 )
