@@ -749,8 +749,22 @@ class RepetitionFilterConfig(BaseModel):
     ] = 0.99
 
 
+class ZeroAdvantageFilterConfig(BaseModel):
+    """Flags rollouts with zero advantage."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    type: Literal["zero_advantage"] = "zero_advantage"
+    enforce: Annotated[
+        bool,
+        Field(
+            description="If True, mask detected rollouts so they don't contribute to training. If False, only track detection metrics."
+        ),
+    ] = True
+
+
 FilterConfig: TypeAlias = Annotated[
-    GibberishFilterConfig | RepetitionFilterConfig,
+    GibberishFilterConfig | RepetitionFilterConfig | ZeroAdvantageFilterConfig,
     Field(discriminator="type"),
 ]
 
@@ -862,7 +876,7 @@ class OrchestratorConfig(BaseConfig):
     advantage: AdvantageConfig | None = DefaultAdvantageConfig()
 
     # Rollout filters (monitor by default, enforce optionally)
-    filters: list[FilterConfig] = [GibberishFilterConfig(), RepetitionFilterConfig()]
+    filters: list[FilterConfig] = [GibberishFilterConfig(), RepetitionFilterConfig(), ZeroAdvantageFilterConfig()]
 
     # The logging configuration
     log: LogConfig = LogConfig()

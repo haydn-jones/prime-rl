@@ -46,7 +46,6 @@ from prime_rl.orchestrator.utils import (
     setup_external_rollout_model,
 )
 from prime_rl.orchestrator.vf_utils import (
-    get_completion_len,
     get_seq_len,
     intercept_vf_logging,
     save_rollouts,
@@ -182,8 +181,6 @@ async def orchestrate(config: OrchestratorConfig):
 
     # Build rollout filters
     rollout_filters = setup_filters(config.filters, vocab_size=tokenizer.vocab_size)
-    if rollout_filters:
-        logger.info(f"Initialized {len(rollout_filters)} rollout filter(s): {[f.name for f in rollout_filters]}")
 
     # Load environments
     logger.info("Loading training environments")
@@ -419,21 +416,14 @@ async def orchestrate(config: OrchestratorConfig):
                     f"VLM offloaded {num_offloaded} unique images to disk in {time.perf_counter() - offload_start:.2f}s"
                 )
 
-        # Apply rollout filters (zeros reward/mask for degenerate generations)
-        filter_metrics = apply_filters(rollout_filters, train_rollouts)
-
-        # Compute advantages
+        # Compute advantages (in-place)
         example_ids = [r["example_id"] for r in train_rollouts]
         num_rollouts = len(train_rollouts)
         num_unique_examples = len(set(example_ids))
-        rewards = [r["reward"] for r in train_rollouts]
-        completion_lens = [get_completion_len(r) for r in train_rollouts]
-        advantages = compute_advantages(
-            rewards,
-            completion_lens,
-            config.rollouts_per_example,
-            config.advantage,
-        )
+        compute_advantages(train_rollouts, config.rollouts_per_example, config.advantage)
+
+        # Apply rollout filters (zeros reward/mask for degenerate generations)
+        filter_metrics = apply_filters(rollout_filters, train_rollouts)
 
         # Convert rollouts to training samples
         parallel_preprocess_start = time.perf_counter()
@@ -447,16 +437,25 @@ async def orchestrate(config: OrchestratorConfig):
         # and — with max_async_level >= 2 — overlap with the next batch's inference.
         if is_vlm:
             vlm_cache = await asyncio.to_thread(build_vlm_image_cache, train_rollouts, processor)
+            mm_token_type_ids_mapping = {}
+            if hasattr(processor, "image_token_id") and processor.image_token_id is not None:
+                mm_token_type_ids_mapping[processor.image_token_id] = 1
+            if hasattr(processor, "video_token_id") and processor.video_token_id is not None:
+                mm_token_type_ids_mapping[processor.video_token_id] = 2
+
             logger.info(
                 f"VLM timing: extract={vlm_cache.extract_time:.2f}s, preprocess={vlm_cache.preprocess_time:.2f}s "
                 f"({vlm_cache.num_unique_images} unique images from {vlm_cache.num_unique_examples} examples)"
             )
         else:
             vlm_cache = None
+            mm_token_type_ids_mapping = None
 
         # Process rollouts in parallel
         def process_rollout(rollout: vf.RolloutOutput, rollout_idx: int) -> list[TrainingSample] | None:
-            return interleave_rollout(rollout, vlm_cache=vlm_cache, cache_key=rollout_idx)
+            return interleave_rollout(
+                rollout, vlm_cache=vlm_cache, cache_key=rollout_idx, mm_token_type_ids_mapping=mm_token_type_ids_mapping
+            )
 
         results = await asyncio.gather(
             *(asyncio.to_thread(process_rollout, r, rollout_idx) for rollout_idx, r in enumerate(train_rollouts))
@@ -469,13 +468,13 @@ async def orchestrate(config: OrchestratorConfig):
         rollout_samples_per_rollout: list[int] = []
         num_prefill_tokens = 0
         num_decode_tokens = 0
-        for rollout, advantage, samples in zip(train_rollouts, advantages, results):
+        for rollout, samples in zip(train_rollouts, results):
             rollout_prefill_tokens = 0
             rollout_decode_tokens = 0
             if samples is not None:
                 rollout_samples_per_rollout.append(len(samples))
                 for sample in samples:
-                    sample.advantage = advantage
+                    sample.advantage = rollout["advantage"]
                     sample.reward = rollout["reward"]
                     sample_decode_tokens = sum(sample.completion_mask)
                     sample_prefill_tokens = len(sample.prompt_ids) + len(sample.completion_mask) - sample_decode_tokens
@@ -670,8 +669,8 @@ async def orchestrate(config: OrchestratorConfig):
         # Log distributions (rewards, advantages) if enabled
         monitor.log_distributions(
             distributions={
-                "rewards": rewards,
-                "advantages": advantages,
+                "rewards": [r["reward"] for r in train_rollouts],
+                "advantages": [r["advantage"] for r in train_rollouts],
             },
             step=progress.step,
         )
