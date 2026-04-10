@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
-from typing import cast
+from typing import NamedTuple, cast
 
 import torch
 from torch import Tensor, nn
 from torch.nn.attention.flex_attention import BlockMask, FlexKernelOptions, create_block_mask, flex_attention
+from torch.nn.attention.varlen import varlen_attn
 from transformers.activations import ACT2FN
 from transformers.modeling_layers import GradientCheckpointingLayer
 from transformers.modeling_outputs import BaseModelOutputWithPast
@@ -20,11 +21,13 @@ from prime_rl.trainer.models.layers.lm_head import PrimeLmOutput
 _compiled_flex_attention = torch.compile(
     flex_attention,
     options={
-        "max_autotune": True,
-        "coordinate_descent_tuning": True,
+        # "max_autotune": True,
+        # "coordinate_descent_tuning": True,
         "triton.cudagraphs": False,
     },
 )
+
+_compiled_create_block_mask = torch.compile(create_block_mask)
 
 # For head_dim=512 (full attention layers), default block sizes OOM on registers.
 # BLOCK_M/N=32 fits within B200's 232448-byte register limit.
@@ -77,22 +80,51 @@ def _get_kv_sharing_info(config: Gemma4TextConfig, layer_idx: int) -> tuple[int 
     return None, layer_idx == source_idx
 
 
-def _document_ids(position_ids: torch.Tensor) -> torch.Tensor:
-    """Compute per-token document IDs from position_ids (resets mark new documents).
+def _layer_head_dim(config: Gemma4TextConfig, layer_type: str) -> int:
+    return config.global_head_dim if layer_type == "full_attention" else config.head_dim
+
+
+class _PackedAttentionMetadata(NamedTuple):
+    doc_ids: torch.Tensor
+    total_len: int
+    cu_seq: torch.Tensor | None = None
+    max_seq_len: int | None = None
+
+
+def _build_packed_attention_metadata(
+    position_ids: torch.Tensor,
+    *,
+    need_cu_seq: bool,
+) -> _PackedAttentionMetadata:
+    """Build packed-sequence metadata for flex and varlen attention.
 
     A new document begins wherever positions reset, i.e. positions[i] <= positions[i-1].
-    Returns a flat 1D tensor of document IDs (since we use B=None for BlockMask).
+    For flex attention we use per-token document IDs. For varlen attention we also
+    derive cumulative sequence offsets over the packed documents.
     """
     flat = position_ids.reshape(-1)
     boundaries = torch.zeros_like(flat, dtype=torch.bool)
     boundaries[1:] = flat[1:] <= flat[:-1]
-    return boundaries.int().cumsum(0)
+    doc_ids = boundaries.int().cumsum(0)
+
+    if not need_cu_seq:
+        return _PackedAttentionMetadata(doc_ids=doc_ids, total_len=flat.numel())
+
+    starts = torch.cat(
+        (flat.new_zeros((1,), dtype=torch.int64), boundaries.nonzero(as_tuple=False).flatten()),
+    )
+    cu_seq = torch.empty(starts.numel() + 1, device=flat.device, dtype=torch.int32)
+    cu_seq[:-1] = starts.to(torch.int32)
+    cu_seq[-1] = flat.numel()
+    max_seq_len = int(torch.diff(cu_seq).max().item())
+    return _PackedAttentionMetadata(doc_ids=doc_ids, total_len=flat.numel(), cu_seq=cu_seq, max_seq_len=max_seq_len)
 
 
 def _build_flex_block_masks(
     doc_ids: torch.Tensor,
     total_len: int,
     sliding_window: int | None,
+    layer_types: set[str],
 ) -> dict[str, BlockMask]:
     """Build BlockMasks for flex_attention: one per layer type (sliding vs full).
 
@@ -103,18 +135,18 @@ def _build_flex_block_masks(
     def _causal_packed(b: torch.Tensor, h: torch.Tensor, q_idx: torch.Tensor, kv_idx: torch.Tensor) -> torch.Tensor:
         return (q_idx >= kv_idx) & (doc_ids[q_idx] == doc_ids[kv_idx])
 
-    masks: dict[str, BlockMask] = {
-        "full_attention": create_block_mask(
+    masks: dict[str, BlockMask] = {}
+    if "full_attention" in layer_types:
+        masks["full_attention"] = _compiled_create_block_mask(
             _causal_packed, B=None, H=None, Q_LEN=total_len, KV_LEN=total_len, device=doc_ids.device,
-        ),
-    }
+        )
 
-    if sliding_window is not None:
+    if sliding_window is not None and "sliding_attention" in layer_types:
 
         def _sliding_packed(b: torch.Tensor, h: torch.Tensor, q_idx: torch.Tensor, kv_idx: torch.Tensor) -> torch.Tensor:
             return (kv_idx <= q_idx) & (q_idx - kv_idx < sliding_window) & (doc_ids[q_idx] == doc_ids[kv_idx])
 
-        masks["sliding_attention"] = create_block_mask(
+        masks["sliding_attention"] = _compiled_create_block_mask(
             _sliding_packed, B=None, H=None, Q_LEN=total_len, KV_LEN=total_len, device=doc_ids.device,
         )
 
@@ -150,7 +182,7 @@ class Gemma4DualRotaryEmbedding(nn.Module):
                 kwargs["head_dim_key"] = "global_head_dim"
             return ROPE_INIT_FUNCTIONS[rope_type](config, **kwargs)[0]
 
-        head_dim = config.global_head_dim if layer_type == "full_attention" else config.head_dim
+        head_dim = _layer_head_dim(config, layer_type)
         rotary_dim = int(head_dim * rope_params.get("partial_rotary_factor", 1.0))
         steps = torch.arange(0, rotary_dim, 2, device=device, dtype=torch.float)
         return 1.0 / (rope_params["rope_theta"] ** (steps / rotary_dim))
@@ -183,10 +215,15 @@ class Gemma4Attention(nn.Module):
         super().__init__()
         self.layer_idx = layer_idx
         self.layer_type = config.layer_types[layer_idx]  # ty:ignore[not-subscriptable]
-        self.head_dim = config.global_head_dim if self.layer_type == "full_attention" else config.head_dim
+        self.head_dim = _layer_head_dim(config, self.layer_type)
         self.num_key_value_heads = config.num_key_value_heads
         self.kv_shared_layer_index, self.store_full_length_kv = _get_kv_sharing_info(config, layer_idx)
         self._kernel_options = _FLEX_HD512_KERNEL_OPTIONS if self.head_dim > 256 else FlexKernelOptions()
+        self._use_varlen_attn = getattr(config, "_attn_implementation", None) == "varlen" and self.head_dim == 256
+        if self.layer_type == "sliding_attention":
+            self._varlen_window_size = (cast(int, config.sliding_window), 0)
+        else:
+            self._varlen_window_size = (-1, 0)
 
         self.q_proj = nn.Linear(
             config.hidden_size,
@@ -243,6 +280,7 @@ class Gemma4Attention(nn.Module):
         hidden_states: torch.Tensor,
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
         block_mask: BlockMask | None = None,
+        packed_attention: _PackedAttentionMetadata | None = None,
         shared_kv: dict[int, tuple[torch.Tensor, torch.Tensor]] | None = None,
     ) -> torch.Tensor:
         if self.kv_shared_layer_index is not None and shared_kv is not None:
@@ -253,17 +291,33 @@ class Gemma4Attention(nn.Module):
         else:
             q, k, v = self.attn_projections(hidden_states, position_embeddings)
 
-        # (batch*seq, heads, dim) -> (1, heads, batch*seq, dim) for flex_attention
-        q = q.contiguous().flatten(0, 1).unsqueeze(0).transpose(1, 2)
-        k = k.contiguous().flatten(0, 1).unsqueeze(0).transpose(1, 2)
-        v = v.contiguous().flatten(0, 1).unsqueeze(0).transpose(1, 2)
+        if self._use_varlen_attn:
+            if packed_attention is None or packed_attention.cu_seq is None or packed_attention.max_seq_len is None:
+                raise ValueError("Varlen attention requires packed sequence metadata.")
+            attn_output = varlen_attn(
+                q.contiguous().flatten(0, 1),
+                k.contiguous().flatten(0, 1),
+                v.contiguous().flatten(0, 1),
+                packed_attention.cu_seq,
+                packed_attention.cu_seq,
+                packed_attention.max_seq_len,
+                packed_attention.max_seq_len,
+                scale=1.0,
+                window_size=self._varlen_window_size,
+            )
+        else:
+            # (batch*seq, heads, dim) -> (1, heads, batch*seq, dim) for flex_attention
+            q = q.contiguous().flatten(0, 1).unsqueeze(0).transpose(1, 2)
+            k = k.contiguous().flatten(0, 1).unsqueeze(0).transpose(1, 2)
+            v = v.contiguous().flatten(0, 1).unsqueeze(0).transpose(1, 2)
 
-        attn_output: torch.Tensor = _compiled_flex_attention(
-            q, k, v, block_mask=block_mask, scale=1.0,
-            enable_gqa=True, kernel_options=self._kernel_options,
-        )  # ty:ignore[invalid-assignment]
+            attn_output = _compiled_flex_attention(
+                q, k, v, block_mask=block_mask, scale=1.0,
+                enable_gqa=True, kernel_options=self._kernel_options,
+            )  # ty:ignore[invalid-assignment]
 
-        attn_output = attn_output.transpose(1, 2).squeeze(0)
+            attn_output = attn_output.transpose(1, 2).squeeze(0)
+
         attn_output = attn_output.contiguous().view(*hidden_states.shape[:-1], -1)
         return self.output_proj(attn_output)
 
@@ -309,6 +363,7 @@ class Gemma4DecoderLayer(GradientCheckpointingLayer):
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
         per_layer_input: torch.Tensor | None = None,
         shared_kv: dict[int, tuple[torch.Tensor, torch.Tensor]] | None = None,
+        packed_attention: _PackedAttentionMetadata | None = None,
         block_mask: BlockMask | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         residual = hidden_states
@@ -320,7 +375,13 @@ class Gemma4DecoderLayer(GradientCheckpointingLayer):
         if self.self_attn.store_full_length_kv:
             source_kv = self.self_attn.compute_kv(normed, position_embeddings)
 
-        hidden_states = self.self_attn(normed, position_embeddings, block_mask, shared_kv)
+        hidden_states = self.self_attn(
+            normed,
+            position_embeddings,
+            block_mask=block_mask,
+            packed_attention=packed_attention,
+            shared_kv=shared_kv,
+        )
         hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = residual + hidden_states
 
@@ -348,6 +409,7 @@ class Gemma4Model(nn.Module):
     def __init__(self, config: Gemma4TextConfig) -> None:
         super().__init__()
         self.config = config
+        self._attn_implementation = getattr(config, "_attn_implementation", "flex_attention")
         pad_token_id = cast(int, config.pad_token_id)
         self.embed_tokens = Gemma4ScaledWordEmbedding(
             config.vocab_size,
@@ -358,6 +420,15 @@ class Gemma4Model(nn.Module):
         self.layers = nn.ModuleList(Gemma4DecoderLayer(config, i) for i in range(config.num_hidden_layers))
         self.norm = _RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.rotary_emb = Gemma4DualRotaryEmbedding(config)
+        self.layer_types = cast(list[str], config.layer_types)
+        self._need_varlen_metadata = self._attn_implementation == "varlen" and any(
+            _layer_head_dim(config, layer_type) == 256 for layer_type in set(self.layer_types)
+        )
+        self._flex_layer_types = {
+            layer_type
+            for layer_type in set(self.layer_types)
+            if not (self._attn_implementation == "varlen" and _layer_head_dim(config, layer_type) == 256)
+        }
 
         self.hidden_size_per_layer_input = config.hidden_size_per_layer_input
         if self.hidden_size_per_layer_input:
@@ -409,20 +480,23 @@ class Gemma4Model(nn.Module):
             assert input_ids is not None
             per_layer_inputs = self._build_per_layer_inputs(input_ids, inputs_embeds)
 
-        doc_ids = _document_ids(position_ids)
-        total_len = position_ids.shape[0] * position_ids.shape[1]
-        block_masks = _build_flex_block_masks(doc_ids, total_len, self.config.sliding_window)
+        packed_attention = _build_packed_attention_metadata(position_ids, need_cu_seq=self._need_varlen_metadata)
+        block_masks = _build_flex_block_masks(
+            packed_attention.doc_ids,
+            packed_attention.total_len,
+            self.config.sliding_window,
+            self._flex_layer_types,
+        )
 
-        layer_types = cast(list[str], self.config.layer_types)
         position_embeddings = {
             layer_type: self.rotary_emb(inputs_embeds, position_ids, layer_type)
-            for layer_type in set(layer_types)
+            for layer_type in set(self.layer_types)
         }
 
         hidden_states = inputs_embeds
         shared_kv: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
         for i, layer in enumerate(self.layers):
-            layer_type = layer_types[i]
+            layer_type = self.layer_types[i]
             # .contiguous() is required for activation offloading compatibility:
             # the slice is a view with large strides from the parent tensor, and
             # offloading via saved_tensors_hooks can't preserve those strides on
@@ -433,7 +507,8 @@ class Gemma4Model(nn.Module):
                 position_embeddings[layer_type],
                 pli,
                 shared_kv,
-                block_masks[layer_type],
+                packed_attention,
+                block_masks.get(layer_type),
             )
             # Source layers return (hidden_states, k, v); store KV outside the checkpointed region
             if isinstance(out, tuple):

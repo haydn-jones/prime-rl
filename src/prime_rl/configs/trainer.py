@@ -18,7 +18,7 @@ from prime_rl.utils.config import BaseConfig
 # -- Shared trainer configs (used by both SFT and RL trainers) --
 
 AttnImplementation: TypeAlias = Literal[
-    "sdpa", "flash_attention_2", "flash_attention_3", "flash_attention_4", "fa4", "flex_attention"
+    "sdpa", "flash_attention_2", "flash_attention_3", "flash_attention_4", "fa4", "flex_attention", "varlen"
 ]
 EPCommBackend: TypeAlias = Literal["torch", "deepep"]
 
