@@ -104,6 +104,30 @@ def validate_shared_max_async_level(
         )
 
 
+def validate_shared_tokenizer(
+    trainer: TrainerConfig,
+    orchestrator: OrchestratorConfig,
+    inference: Optional[InferenceConfig] = None,
+) -> None:
+    # Validate chat_template is consistent across all components.
+    # We only check chat_template (not name/trust_remote_code) because those
+    # are auto-derived from model names which may legitimately differ (e.g.
+    # when inference uses an FP8 quantized variant of the same model).
+    if trainer.tokenizer.chat_template != orchestrator.tokenizer.chat_template:
+        raise ValueError(
+            f"Trainer chat_template ({trainer.tokenizer.chat_template!r}) and orchestrator "
+            f"chat_template ({orchestrator.tokenizer.chat_template!r}) do not match. "
+            f"Use the shared [tokenizer] config to set chat_template for both."
+        )
+    if inference is not None:
+        if trainer.tokenizer.chat_template != inference.model.chat_template:
+            raise ValueError(
+                f"Inference chat_template ({inference.model.chat_template!r}) does not match "
+                f"the shared tokenizer chat_template ({trainer.tokenizer.chat_template!r}). "
+                f"Use the shared [tokenizer] config to set chat_template for all components."
+            )
+
+
 def validate_shared_weight_broadcast(
     trainer: TrainerConfig,
     orchestrator: OrchestratorConfig,

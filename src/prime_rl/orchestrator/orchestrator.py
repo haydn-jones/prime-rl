@@ -30,7 +30,7 @@ monkey_patch_chat_completion_logprobs()
 
 import pandas as pd
 import verifiers as vf
-from transformers import AutoProcessor, AutoTokenizer
+from transformers import AutoProcessor
 
 from prime_rl.configs.orchestrator import OrchestratorConfig
 from prime_rl.orchestrator.buffer import Buffer
@@ -50,6 +50,7 @@ from prime_rl.orchestrator.vf_utils import (
     intercept_vf_logging,
     save_rollouts,
 )
+from prime_rl.trainer.model import setup_tokenizer
 from prime_rl.utils.client import (
     init_nccl_broadcast,
     setup_inference_pool,
@@ -137,8 +138,8 @@ async def orchestrate(config: OrchestratorConfig):
     is_vlm = config.model.vlm is not None
 
     # Load tokenizer and processor (processor only for VLM models)
-    logger.info(f"Initializing tokenizer for {config.model.name}")
-    tokenizer = AutoTokenizer.from_pretrained(config.model.name, trust_remote_code=config.model.trust_remote_code)
+    logger.info(f"Initializing tokenizer ({config.tokenizer})")
+    tokenizer = setup_tokenizer(config.tokenizer)
 
     processor = None
     if is_vlm:

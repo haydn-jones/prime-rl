@@ -100,7 +100,7 @@ def rl_local(config: RLConfig):
     assert config.deployment.type == "single_node"
 
     logger = setup_logger(
-        config.log.level or "info",
+        config.log.level or os.environ.get("PRIME_LOG_LEVEL", "info"),
         json_logging=config.log.json_logging,
     )
 
@@ -442,8 +442,8 @@ def write_slurm_script(config: RLConfig, config_dir: Path, script_path: Path) ->
             use_deep_gemm=config.inference.use_deep_gemm,
             prefill_env_overrides=infer_deploy.prefill_env_overrides,
             decode_env_overrides=infer_deploy.decode_env_overrides,
+            dp_per_node=config.deployment.gpus_per_node // config.inference.parallel.tp,
             kv_offload=infer_deploy.kv_cache_offload is not None,
-            kv_offload_block_size=infer_deploy.kv_cache_offload.block_size if infer_deploy.kv_cache_offload else 64,
             kv_offload_cpu_bytes=int(infer_deploy.kv_cache_offload.cpu_bytes) if infer_deploy.kv_cache_offload else 0,
             use_nccl_broadcast=config.weight_broadcast is not None and config.weight_broadcast.type == "nccl",
             wandb_shared=config.wandb is not None and config.wandb.shared,
@@ -467,6 +467,7 @@ def write_slurm_script(config: RLConfig, config_dir: Path, script_path: Path) ->
             inference_tp=config.inference.parallel.tp if config.inference else 1,
             inference_enable_expert_parallel=config.inference.enable_expert_parallel if config.inference else False,
             inference_data_parallel_rpc_port=config.inference.data_parallel_rpc_port if config.inference else 29600,
+            dp_per_node=(config.deployment.gpus_per_node // config.inference.parallel.tp) if config.inference else 1,
             use_nccl_broadcast=config.weight_broadcast is not None and config.weight_broadcast.type == "nccl",
             wandb_shared=config.wandb is not None and config.wandb.shared,
             ranks_filter=",".join(map(str, config.trainer.log.ranks_filter)),
@@ -479,7 +480,9 @@ def write_slurm_script(config: RLConfig, config_dir: Path, script_path: Path) ->
 def rl_slurm(config: RLConfig):
     assert config.slurm is not None
 
-    logger = setup_logger(config.log.level or "info", json_logging=config.log.json_logging)
+    logger = setup_logger(
+        config.log.level or os.environ.get("PRIME_LOG_LEVEL", "info"), json_logging=config.log.json_logging
+    )
 
     config_dir = config.output_dir / "configs"
     log_dir = get_log_dir(config.output_dir)

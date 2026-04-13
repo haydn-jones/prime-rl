@@ -7,7 +7,7 @@ from jaxtyping import Float, Int
 from torch import Tensor
 
 from prime_rl.configs.orchestrator import AdvantageConfig, CustomAdvantageConfig
-from prime_rl.orchestrator.vf_utils import get_completion_len
+from prime_rl.orchestrator.vf_utils import get_model_completion_len
 from prime_rl.utils.utils import import_object
 
 
@@ -37,19 +37,52 @@ Expected signature:
 
 def default_advantage_fn(
     inputs: AdvantageInputs,
-    length_shaping_alpha: float | None = None,
+    length_shaping: bool = False,
 ) -> AdvantageOutputs:
     """Default GRPO advantage: reward minus per-problem baseline."""
     rewards = inputs.rewards
 
-    if length_shaping_alpha is not None:
+    if length_shaping:
         completion_lengths = inputs.completion_lengths.to(dtype=rewards.dtype)
-        lengths_normalized = completion_lengths / completion_lengths.mean(dim=1, keepdim=True)
-        length_shaping = (1 + length_shaping_alpha * lengths_normalized) ** -1
-        rewards = rewards * length_shaping
-    baseline = rewards.mean(dim=1, keepdim=True)
+        return AdvantageOutputs(advantages=_efficiency_length_shaping(rewards, completion_lengths))
 
+    baseline = rewards.mean(dim=1, keepdim=True)
     return AdvantageOutputs(advantages=rewards - baseline)
+
+
+def _efficiency_length_shaping(
+    rewards: Float[Tensor, "num_problems rollouts_per_example"],
+    completion_lengths: Float[Tensor, "num_problems rollouts_per_example"],
+) -> Float[Tensor, "num_problems rollouts_per_example"]:
+    """Correctness-gated length shaping with bounded advantages.
+
+    Shapes rewards with a bounded brevity bonus before standard GRPO subtraction,
+    preserving zero-mean advantages per group.
+
+    Correct rollouts get reward amplified by up to 2x based on relative brevity.
+    Incorrect rollouts are untouched. Shorter correct rollouts get higher advantage.
+    """
+    max_reward = rewards.max(dim=1, keepdim=True).values
+    correct_mask = rewards >= max_reward
+    num_correct = correct_mask.sum(dim=1, keepdim=True)
+
+    # No shaping when max reward is 0 — no correct rollouts to differentiate
+    has_correct = max_reward > 0
+
+    # Mean length of correct rollouts per problem
+    correct_lengths = completion_lengths * correct_mask
+    mean_correct_len = correct_lengths.sum(dim=1, keepdim=True) / num_correct.clamp(min=1)
+
+    # Bounded brevity bonus: [0, 1], positive for below-average length, zero for above
+    bonus = (1 - completion_lengths / mean_correct_len).clamp(0, 1)
+
+    # Shape rewards: correct rollouts amplified by up to 2x, incorrect untouched
+    shaped_rewards = rewards * (1 + bonus * correct_mask)
+    baseline = shaped_rewards.mean(dim=1, keepdim=True)
+
+    shaped = shaped_rewards - baseline
+    unshaped = rewards - rewards.mean(dim=1, keepdim=True)
+    return torch.where(has_correct, shaped, unshaped)
 
 
 def setup_advantage_fn(config: AdvantageConfig) -> AdvantageFn:
@@ -66,7 +99,7 @@ def setup_advantage_fn(config: AdvantageConfig) -> AdvantageFn:
     def advantage_fn(inputs: AdvantageInputs) -> AdvantageOutputs:
         return default_advantage_fn(
             inputs,
-            length_shaping_alpha=config.length_shaping_alpha,
+            length_shaping=config.length_shaping,
         )
 
     return advantage_fn
@@ -94,7 +127,7 @@ def compute_advantages(
         return
 
     advantage_fn = setup_advantage_fn(advantage_config)
-    completion_lengths = [get_completion_len(r) for r in rollouts]
+    completion_lengths = [get_model_completion_len(r) for r in rollouts]
 
     inputs = AdvantageInputs(
         rewards=torch.tensor(rewards).view(-1, samples_per_problem),

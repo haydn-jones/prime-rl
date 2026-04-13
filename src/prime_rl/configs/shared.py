@@ -1,3 +1,4 @@
+import os
 from pathlib import Path
 from typing import Annotated, Literal, TypeAlias
 
@@ -271,13 +272,19 @@ class LogConfig(BaseConfig):
 
     level: Annotated[
         str,
-        Field(description="Logging level for the process. Will determine the logging verbosity and format."),
-    ] = "info"
+        Field(
+            default_factory=lambda: os.environ.get("PRIME_LOG_LEVEL", "info"),
+            description="Logging level for the process. Will determine the logging verbosity and format. Defaults to the PRIME_LOG_LEVEL env var if set, else 'info'.",
+        ),
+    ]
 
     vf_level: Annotated[
         str,
-        Field(description="Logging level for the verifiers package. Will determine the logging verbosity and format."),
-    ] = "info"
+        Field(
+            default_factory=lambda: os.environ.get("PRIME_VF_LOG_LEVEL", "info"),
+            description="Logging level for the verifiers package. Will determine the logging verbosity and format. Defaults to the PRIME_VF_LOG_LEVEL env var if set, else 'info'.",
+        ),
+    ]
 
     json_logging: Annotated[
         bool,

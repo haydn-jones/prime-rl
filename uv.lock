@@ -2850,7 +2850,7 @@ requires-dist = [
     { name = "uvloop", specifier = ">=0.21.0" },
     { name = "verifiers", git = "https://github.com/PrimeIntellect-ai/verifiers.git?rev=0760204" },
     { name = "vllm", specifier = ">=0.19.0" },
-    { name = "vllm-router", marker = "platform_machine == 'x86_64' and extra == 'disagg'", url = "https://github.com/PrimeIntellect-ai/router/releases/download/v0.1.18/vllm_router-0.1.16-cp38-abi3-manylinux_2_28_x86_64.whl" },
+    { name = "vllm-router", marker = "platform_machine == 'x86_64' and extra == 'disagg'", url = "https://github.com/PrimeIntellect-ai/router/releases/download/v0.1.20/vllm_router-0.1.20-cp38-abi3-manylinux_2_28_x86_64.whl" },
     { name = "wandb", specifier = ">=0.24.2" },
     { name = "wiki-search", marker = "extra == 'envs'", index = "https://hub.primeintellect.ai/primeintellect/simple/" },
 ]
@@ -4256,8 +4256,8 @@ wheels = [
 
 [[package]]
 name = "vllm-router"
-version = "0.1.16"
-source = { url = "https://github.com/PrimeIntellect-ai/router/releases/download/v0.1.18/vllm_router-0.1.16-cp38-abi3-manylinux_2_28_x86_64.whl" }
+version = "0.1.20"
+source = { url = "https://github.com/PrimeIntellect-ai/router/releases/download/v0.1.20/vllm_router-0.1.20-cp38-abi3-manylinux_2_28_x86_64.whl" }
 dependencies = [
     { name = "aiohttp", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
     { name = "fastapi", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
@@ -4267,7 +4267,7 @@ dependencies = [
     { name = "uvicorn", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
 ]
 wheels = [
-    { url = "https://github.com/PrimeIntellect-ai/router/releases/download/v0.1.18/vllm_router-0.1.16-cp38-abi3-manylinux_2_28_x86_64.whl", hash = "sha256:8bea20e6bbb1792208204d034d68c9a88872a812af2734f27f700738c1070d89" },
+    { url = "https://github.com/PrimeIntellect-ai/router/releases/download/v0.1.20/vllm_router-0.1.20-cp38-abi3-manylinux_2_28_x86_64.whl", hash = "sha256:88814218907942405bf43f1086abfaff352361d5fe7955aa8234a0ebf0651243" },
 ]
 
 [package.metadata]

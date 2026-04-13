@@ -17,6 +17,7 @@ def transformers_v5_compat():
     _patch_lora_key_prefix()
     monkey_patch_deep_gemm_ep_scatter()
     monkey_patch_dp_engine_core_pause_resume_deadlock()
+    monkey_patch_offloading_connector_cpu_block_count()
 
 
 @triton.jit
@@ -951,6 +952,49 @@ def monkey_patch_dp_engine_core_pause_resume_deadlock():
     DPEngineCoreProc._handle_client_request = _patched_handle_client_request
     DPEngineCoreProc.resume_scheduler = _patched_resume_scheduler
     DPEngineCoreProc._has_global_unfinished_reqs = _patched_has_global_unfinished_reqs
+
+
+def monkey_patch_offloading_connector_cpu_block_count():
+    """Fix CPU block count miscalculation in OffloadingConnector.
+
+    CPUOffloadingSpec erroneously multiplies page_size_bytes by
+    len(kv_cache_config.kv_cache_tensors) when computing kv_bytes_per_block.
+    For UniformTypeKVCacheSpecs the page_size is already the total per-block
+    size across all layers, so the extra multiplier makes num_blocks far too
+    small. When the OffloadingManager later allocates block IDs past the
+    undersized CPU tensor, swap_blocks (cuMemcpyDtoHAsync_v2) segfaults on the
+    invalid pinned address.
+
+    Fix: remove the num_tensors multiplier.
+
+    Upstream: https://github.com/vllm-project/vllm/pull/38395
+    Related: https://github.com/vllm-project/vllm/issues/39500
+    """
+    from vllm.v1.kv_offload.cpu.spec import CPUOffloadingSpec
+
+    _original_init = CPUOffloadingSpec.__init__
+
+    def _patched_init(self, vllm_config, kv_cache_config):
+        _original_init(self, vllm_config, kv_cache_config)
+
+        # Recalculate num_blocks WITHOUT the erroneous num_tensors multiplier.
+        cpu_bytes_to_use = self.extra_config.get("cpu_bytes_to_use")
+        if not cpu_bytes_to_use:
+            return
+
+        page_sizes = {g.kv_cache_spec.page_size_bytes for g in kv_cache_config.kv_cache_groups}
+        assert len(page_sizes) == 1
+        page_size_bytes = page_sizes.pop()
+
+        # page_size_bytes already covers all layers in the group.
+        # Only multiply by world_size (each TP rank stores its own copy).
+        kv_bytes_per_block = page_size_bytes * vllm_config.parallel_config.world_size
+        kv_bytes_per_offloaded_block = kv_bytes_per_block * self.block_size_factor
+        self.num_blocks = (
+            int(cpu_bytes_to_use) // kv_bytes_per_offloaded_block if kv_bytes_per_offloaded_block > 0 else 0
+        )
+
+    CPUOffloadingSpec.__init__ = _patched_init
 
 
 def monkey_patch_no_moe_lora():

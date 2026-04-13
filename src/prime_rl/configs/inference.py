@@ -71,6 +71,14 @@ class ModelConfig(BaseModelConfig):
         ),
     ] = False
 
+    chat_template: Annotated[
+        str | None,
+        Field(
+            description="Chat template to use. Can be a Jinja2 template string or a path to a template file. "
+            "Passed to vLLM as `--chat-template`. If None, uses the model's default.",
+        ),
+    ] = None
+
     tool_call_parser: Annotated[
         str | None,
         Field(
@@ -111,9 +119,8 @@ All2AllBackend = Literal[
     "allgather_reducescatter",
     "deepep_high_throughput",
     "deepep_low_latency",
-    "flashinfer_all2allv",
-    "naive",
-    "pplx",
+    "flashinfer_nvlink_one_sided",
+    "flashinfer_nvlink_two_sided",
 ]
 
 
@@ -140,20 +147,23 @@ class MultiNodeInferenceDeploymentConfig(BaseInferenceDeploymentConfig):
 
     router_port: Annotated[int, Field(description="Port for the vllm-router.")] = 8000
     backend_port: Annotated[int, Field(description="Port for vLLM backend instances.")] = 8100
+    router_policy: Annotated[
+        str, Field(description="Routing policy for the vllm-router (e.g. 'consistent_hash', 'round_robin').")
+    ] = "consistent_hash"
 
 
 class KVCacheOffloadConfig(BaseModel):
-    """CPU KV cache offloading for disaggregated prefill nodes.
+    """CPU KV cache offloading for disaggregated serving.
 
-    When configured, prefill nodes use MultiConnector (NixlConnector + OffloadingConnector).
-    Decode nodes always use NixlConnector only.
+    When configured, both prefill and decode nodes use
+    MultiConnector (NixlConnector + OffloadingConnector).
     """
 
     model_config = ConfigDict(extra="forbid")
 
-    block_size: Annotated[int, Field(ge=1, description="Block size for the CPU offloading connector.")] = 64
-
-    cpu_bytes: Annotated[int, Field(ge=0, description="CPU bytes available for KV cache offloading.")] = 1_000_000_000
+    cpu_bytes: Annotated[int, Field(ge=0, description="CPU bytes available for KV cache offloading per worker.")] = (
+        1_000_000_000
+    )
 
 
 class DisaggregatedInferenceDeploymentConfig(BaseInferenceDeploymentConfig):
@@ -191,6 +201,9 @@ class DisaggregatedInferenceDeploymentConfig(BaseInferenceDeploymentConfig):
     router_port: Annotated[int, Field(description="Port for the vllm-router on each replica.")] = 8000
     prefill_port: Annotated[int, Field(description="Port for prefill vLLM instances.")] = 8100
     decode_port: Annotated[int, Field(description="Port for decode vLLM instances.")] = 8200
+    router_policy: Annotated[
+        str, Field(description="Routing policy for the vllm-router (e.g. 'consistent_hash', 'round_robin').")
+    ] = "consistent_hash"
 
     prefill_env_overrides: Annotated[
         dict[str, str],
@@ -483,6 +496,7 @@ class InferenceConfig(BaseConfig):
             "model.max_model_len": "max_model_len",
             "model.enforce_eager": "enforce_eager",
             "model.trust_remote_code": "trust_remote_code",
+            "model.chat_template": "chat_template",
             "model.tool_call_parser": "tool_call_parser",
             "model.reasoning_parser": "reasoning_parser",
             "model.rope_scaling": "rope_scaling",
@@ -512,6 +526,10 @@ class InferenceConfig(BaseConfig):
 
         # Set `logprobs_mode` to `processed_logprobs` by default
         rsetattr(namespace, "logprobs_mode", "processed_logprobs")
+
+        # Remove chat_template if not set (vLLM doesn't accept None)
+        if namespace.chat_template is None:
+            delattr(namespace, "chat_template")
 
         # Remove reasoning_parser if not set (vLLM doesn't accept None)
         if namespace.reasoning_parser is None:

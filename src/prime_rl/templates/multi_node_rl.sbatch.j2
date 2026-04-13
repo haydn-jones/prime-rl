@@ -197,11 +197,17 @@ if [ "$SLURM_PROCID" -lt "$NUM_INFER_NODES" ]; then
     export VLLM_NIXL_SIDE_CHANNEL_PORT=5600
 
 {%- if kv_offload %}
-    PREFILL_KV_CFG='"'"'{"kv_connector":"MultiConnector","kv_role":"kv_both","kv_connector_extra_config":{"connectors":[{"kv_connector":"NixlConnector","kv_role":"kv_both","kv_connector_extra_config":{"num_threads":1}},{"kv_connector":"OffloadingConnector","kv_role":"kv_both","kv_connector_extra_config":{"block_size":{{ kv_offload_block_size }},"cpu_bytes_to_use":{{ kv_offload_cpu_bytes }}}}]}}'"'"'
+    ulimit -l unlimited
+    PREFILL_KV_CFG='"'"'{"kv_connector":"MultiConnector","kv_role":"kv_both","kv_connector_extra_config":{"connectors":[{"kv_connector":"NixlConnector","kv_role":"kv_both","kv_connector_extra_config":{"num_threads":1}},{"kv_connector":"OffloadingConnector","kv_role":"kv_both","kv_connector_extra_config":{"cpu_bytes_to_use":{{ kv_offload_cpu_bytes }}}}]}}'"'"'
 {%- else %}
     PREFILL_KV_CFG='"'"'{"kv_connector":"NixlConnector","kv_role":"kv_both","kv_connector_extra_config":{"num_threads":1}}'"'"'
 {%- endif %}
+
+{%- if kv_offload %}
+    DECODE_KV_CFG='"'"'{"kv_connector":"MultiConnector","kv_role":"kv_both","kv_connector_extra_config":{"connectors":[{"kv_connector":"NixlConnector","kv_role":"kv_both","kv_connector_extra_config":{"num_threads":1}},{"kv_connector":"OffloadingConnector","kv_role":"kv_both","kv_connector_extra_config":{"cpu_bytes_to_use":{{ kv_offload_cpu_bytes }}}}]}}'"'"'
+{%- else %}
     DECODE_KV_CFG='"'"'{"kv_connector":"NixlConnector","kv_role":"kv_both","kv_connector_extra_config":{"num_threads":1}}'"'"'
+{%- endif %}
     DECODE_COMPILE_CFG='"'"'{"cudagraph_mode":"FULL_DECODE_ONLY"}'"'"'
 
     REPLICA_BASE=$((REPLICA_IDX * NODES_PER_INFER_REPLICA))
@@ -270,8 +276,8 @@ if [ "$SLURM_PROCID" -lt "$NUM_INFER_NODES" ]; then
             $REPLICA_ROUTER_ARGS \
             --host 0.0.0.0 \
             --port $ROUTER_PORT \
-            --intra-node-data-parallel-size 1 \
-            --worker-startup-timeout-secs 1200 \
+            --intra-node-data-parallel-size {{ dp_per_node }} \
+            --worker-startup-timeout-secs 4200 \
             >> $ROUTER_LOG 2>&1 &
     fi
 
@@ -296,7 +302,8 @@ if [ "$SLURM_PROCID" -lt "$NUM_INFER_NODES" ]; then
             --worker-urls $REPLICA_ROUTER_ARGS \
             --host 0.0.0.0 \
             --port $ROUTER_PORT \
-            --worker-startup-timeout-secs 1200 \
+            --intra-node-data-parallel-size {{ dp_per_node }} \
+            --worker-startup-timeout-secs 4200 \
             >> $ROUTER_LOG 2>&1 &
     fi
 
