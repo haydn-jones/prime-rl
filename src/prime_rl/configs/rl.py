@@ -52,6 +52,10 @@ from prime_rl.utils.validation import (
 )
 
 
+class RLExperimentalConfig(BaseConfig):
+    """Experimental features for RL training."""
+
+
 class SharedLogConfig(BaseConfig):
     """Configures shared logging."""
 
@@ -349,6 +353,11 @@ class RLConfig(BaseConfig):
     slurm: Annotated[SlurmConfig | None, Field(description="SLURM configuration. If None, will run locally.")] = None
 
     dry_run: Annotated[bool, Field(description="Only validate and dump resolved configs and exit early.")] = False
+
+    experimental: Annotated[
+        RLExperimentalConfig,
+        Field(description="Experimental features for RL training."),
+    ] = RLExperimentalConfig()
 
     ### Validate configs (e.g. raise for unsupported (combinations of) configs)
 

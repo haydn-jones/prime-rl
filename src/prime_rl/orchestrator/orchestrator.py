@@ -8,6 +8,7 @@ import tomli_w
 from prime_rl.orchestrator.advantage import compute_advantages
 from prime_rl.orchestrator.eval_utils import compute_eval_ckpt_step
 from prime_rl.orchestrator.event_loop_lag import EventLoopLagMonitor
+from prime_rl.orchestrator.inference_metrics import InferenceMetricsCollector
 from prime_rl.orchestrator.patches import monkey_patch_chat_completion_logprobs, monkey_patch_oai_iterable_types
 from prime_rl.orchestrator.trajectories import (
     build_vlm_image_cache,
@@ -235,6 +236,7 @@ async def orchestrate(config: OrchestratorConfig):
         enable_policy_updates=enable_policy_updates,
         lora_name=config.model.lora.name if config.model.lora else None,
         config=config,
+        use_prefix_cache_salt=config.experimental.use_prefix_cache_salt,
     )
     scheduler.model_name = rollout_model_name
 
@@ -247,6 +249,12 @@ async def orchestrate(config: OrchestratorConfig):
     await inference_pool.wait_for_ready(rollout_model_name)
 
     logger.success("Inference pool ready")
+
+    # Start inference metrics collector (requires W&B)
+    inference_metrics_collector = None
+    if config.wandb is not None and config.collect_inference_metrics:
+        inference_metrics_collector = InferenceMetricsCollector(inference_pool.admin_clients)
+        await inference_metrics_collector.start()
 
     # Check health of teacher inference server if configured
     if config.teacher_model and teacher_inference_pool:
@@ -372,6 +380,7 @@ async def orchestrate(config: OrchestratorConfig):
                 logger.info("Cancelling in-flight training rollouts before starting evals to avoid congestion.")
                 await scheduler.cancel_inflight_rollouts()
 
+            eval_cache_salt = str(ckpt_step) if config.experimental.use_prefix_cache_salt else None
             eval_results = await asyncio.gather(
                 *[
                     eval_env.evaluate(
@@ -379,6 +388,7 @@ async def orchestrate(config: OrchestratorConfig):
                         get_client=inference_pool.get_eval_client,
                         ckpt_step=ckpt_step,
                         step=progress.step,
+                        cache_salt=eval_cache_salt,
                     )
                     for eval_env in envs_to_eval
                 ]
@@ -704,6 +714,7 @@ async def orchestrate(config: OrchestratorConfig):
 
     if config.eval and eval_envs is not None:
         logger.info("Running final evals")
+        final_cache_salt = str(ckpt_step) if config.experimental.use_prefix_cache_salt else None
         eval_results = await asyncio.gather(
             *[
                 eval_env.evaluate(
@@ -711,6 +722,7 @@ async def orchestrate(config: OrchestratorConfig):
                     get_client=inference_pool.get_eval_client,
                     ckpt_step=ckpt_step,
                     step=progress.step,
+                    cache_salt=final_cache_salt,
                 )
                 for eval_env in eval_envs
             ]
@@ -741,6 +753,8 @@ async def orchestrate(config: OrchestratorConfig):
     async def _graceful_shutdown() -> None:
         training_batch_sender.close()
         await scheduler.stop()
+        if inference_metrics_collector is not None:
+            await inference_metrics_collector.stop()
         await inference_pool.stop()
         if teacher_inference_pool is not None:
             await teacher_inference_pool.stop()

@@ -809,6 +809,19 @@ WeightBroadcastConfig: TypeAlias = Annotated[
 ]
 
 
+class OrchestratorExperimentalConfig(BaseConfig):
+    """Experimental features for the orchestrator."""
+
+    use_prefix_cache_salt: Annotated[
+        bool,
+        Field(
+            description="Whether to set a cache_salt on inference requests that changes with each weight update. "
+            "This invalidates prefix-cached KV states from previous policies without resetting the entire cache, "
+            "while preserving cache hits for in-flight off-policy rollouts.",
+        ),
+    ] = True
+
+
 class TeacherModelConfig(BaseConfig):
     """Configures the teacher model for computing teacher logprobs (e.g. for distillation)."""
 
@@ -896,6 +909,9 @@ class OrchestratorConfig(BaseConfig):
 
     # The prime monitor configuration
     prime_monitor: PrimeMonitorConfig | None = None
+
+    # Whether to collect inference server metrics (requires wandb)
+    collect_inference_metrics: bool = True
 
     # The checkpoint configuration
     ckpt: CheckpointConfig | None = None
@@ -1028,6 +1044,11 @@ class OrchestratorConfig(BaseConfig):
             description="Whether to use the token-in-token-out (TITO) client for training across all environments. WARNING: Only use this if your environment has a linear history and the chat template has the extension property (i.e. no tokens are ever removed or inserted by the chat template)"
         ),
     ] = True
+
+    experimental: Annotated[
+        OrchestratorExperimentalConfig,
+        Field(description="Experimental features for the orchestrator."),
+    ] = OrchestratorExperimentalConfig()
 
     @model_validator(mode="before")
     @classmethod

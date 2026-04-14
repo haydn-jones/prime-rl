@@ -720,6 +720,10 @@ WeightBroadcastConfig: TypeAlias = Annotated[
 ]
 
 
+class TrainerExperimentalConfig(BaseConfig):
+    """Experimental features for the trainer."""
+
+
 class TrainerConfig(BaseConfig):
     """Configures the RL trainer"""
 
@@ -837,6 +841,11 @@ class TrainerConfig(BaseConfig):
             description="The maximum number of concurrent runs to allow. If 1, then only one run will be allowed at a time.",
         ),
     ] = 1
+
+    experimental: Annotated[
+        TrainerExperimentalConfig,
+        Field(description="Experimental features for the trainer."),
+    ] = TrainerExperimentalConfig()
 
     @model_validator(mode="after")
     def deepep_disables_grad_clipping(self):
