@@ -1045,6 +1045,13 @@ class OrchestratorConfig(BaseConfig):
         ),
     ] = True
 
+    env_install_prerelease: Annotated[
+        bool,
+        Field(
+            description="Allow pre-release versions when installing environments (e.g. verifiers>=0.1.12.dev5). Passes --prerelease to prime env install."
+        ),
+    ] = False
+
     experimental: Annotated[
         OrchestratorExperimentalConfig,
         Field(description="Experimental features for the orchestrator."),

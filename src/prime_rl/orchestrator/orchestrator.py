@@ -108,7 +108,7 @@ async def orchestrate(config: OrchestratorConfig):
         env_ids_to_install.update(get_env_ids_to_install(config.eval.env))
 
     for env_id in env_ids_to_install:
-        install_env(env_id)
+        install_env(env_id, prerelease=config.env_install_prerelease)
 
     # Setup rollout inference pool (handles both static and elastic modes)
     rollout_client_config, rollout_model_name, enable_policy_updates = setup_external_rollout_model(config, logger)
@@ -398,7 +398,9 @@ async def orchestrate(config: OrchestratorConfig):
             eval_rollouts = [o for outputs in eval_results for o in outputs]
             if eval_rollouts:
                 step_path = get_step_path(get_rollout_dir(config.output_dir), progress.step)
-                await asyncio.to_thread(save_rollouts, eval_rollouts, step_path / "eval_rollouts.jsonl")
+                await asyncio.to_thread(
+                    save_rollouts, eval_rollouts, step_path / "eval_rollouts.jsonl", exclude_keys={"trajectory"}
+                )
 
             # Resume weight updates
             scheduler.checkpoint_ready.set()
@@ -416,7 +418,9 @@ async def orchestrate(config: OrchestratorConfig):
 
         # Save train rollouts to disk (fire-and-forget background thread)
         step_path = get_step_path(get_rollout_dir(config.output_dir), progress.step)
-        await asyncio.to_thread(save_rollouts, train_rollouts, step_path / "train_rollouts.jsonl")
+        await asyncio.to_thread(
+            save_rollouts, train_rollouts, step_path / "train_rollouts.jsonl", exclude_keys={"trajectory"}
+        )
 
         # VLM: offload base64 images to disk immediately to free memory
         if is_vlm:
@@ -732,7 +736,9 @@ async def orchestrate(config: OrchestratorConfig):
         eval_rollouts = [o for outputs in eval_results for o in outputs]
         if eval_rollouts:
             step_path = get_step_path(get_rollout_dir(config.output_dir), progress.step)
-            await asyncio.to_thread(save_rollouts, eval_rollouts, step_path / "eval_rollouts.jsonl")
+            await asyncio.to_thread(
+                save_rollouts, eval_rollouts, step_path / "eval_rollouts.jsonl", exclude_keys={"trajectory"}
+            )
 
     # Log final (immutable) samples and distributions to monitor(s)
     monitor.log_final_samples()
